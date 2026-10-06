@@ -375,6 +375,22 @@ enum class PositionalMode {
   Append
 };
 
+// Records where the value of an option in a ParseResult came from. This is
+// tracked explicitly while parsing, never reverse-engineered from the final
+// string value.
+enum class OptionSource {
+  // The option was not given on the command line and has no default value.
+  NotProvided,
+  // The value comes from the declared default value.
+  Default,
+  // The flag was given without a value, so the declared implicit value was
+  // used (e.g. "--bool" for a boolean flag).
+  Implicit,
+  // The value was explicitly provided on the command line (this includes an
+  // explicitly empty value such as "--opt=").
+  CommandLine
+};
+
 // some older versions of GCC warn under this warning
 CXXOPTS_IGNORE_WARNING("-Weffc++")
 class Value : public std::enable_shared_from_this<Value>
@@ -1667,19 +1683,22 @@ class OptionValue
     ++m_count;
     m_value->add(text);
     m_long_names = &details->long_names();
+    m_source = OptionSource::CommandLine;
   }
 
   void
   parse
   (
     const std::shared_ptr<const OptionDetails>& details,
-    const std::string& text
+    const std::string& text,
+    OptionSource source = OptionSource::CommandLine
   )
   {
     ensure_value(details);
     ++m_count;
     m_value->parse(text);
     m_long_names = &details->long_names();
+    m_source = source;
   }
 
   void
@@ -1688,6 +1707,7 @@ class OptionValue
     ensure_value(details);
     m_default = true;
     m_long_names = &details->long_names();
+    m_source = OptionSource::Default;
     m_value->parse();
   }
 
@@ -1695,6 +1715,10 @@ class OptionValue
   parse_no_value(const std::shared_ptr<const OptionDetails>& details)
   {
     m_long_names = &details->long_names();
+    if (m_count == 0 && !m_default)
+    {
+      m_source = OptionSource::NotProvided;
+    }
   }
 
 #if defined(CXXOPTS_NULL_DEREF_IGNORE)
@@ -1719,6 +1743,13 @@ CXXOPTS_DIAGNOSTIC_POP
   has_default() const noexcept
   {
     return m_default;
+  }
+
+  CXXOPTS_NODISCARD
+  OptionSource
+  source() const noexcept
+  {
+    return m_source;
   }
 
   template <typename T>
@@ -1762,14 +1793,17 @@ CXXOPTS_DIAGNOSTIC_POP
   std::shared_ptr<Value> m_value{};
   std::size_t m_count = 0;
   bool m_default = false;
+  OptionSource m_source = OptionSource::NotProvided;
 };
 
 class KeyValue
 {
   public:
-  KeyValue(std::string key_, std::string value_) noexcept
+  KeyValue(std::string key_, std::string value_, int position = -1, int offset = -1) noexcept
   : m_key(std::move(key_))
   , m_value(std::move(value_))
+  , m_position(position)
+  , m_offset(offset)
   {
   }
 
@@ -1787,6 +1821,25 @@ class KeyValue
     return m_value;
   }
 
+  // The index in argv at which this argument was seen, or -1 when it did not
+  // come from the command line (e.g. a default value).
+  CXXOPTS_NODISCARD
+  int
+  position() const noexcept
+  {
+    return m_position;
+  }
+
+  // The offset of the option character within a grouped short-option
+  // argument (e.g. 0, 1, 2 for the a, b, c in "-abc"), or -1 when the
+  // argument was not part of such a group.
+  CXXOPTS_NODISCARD
+  int
+  offset() const noexcept
+  {
+    return m_offset;
+  }
+
   template <typename T>
   T
   as() const
@@ -1799,6 +1852,8 @@ class KeyValue
   private:
   std::string m_key;
   std::string m_value;
+  int m_position;
+  int m_offset;
 };
 
 using ParsedHashMap = std::unordered_map<std::size_t, OptionValue>;
@@ -1943,6 +1998,27 @@ CXXOPTS_DIAGNOSTIC_POP
     return static_cast<bool>(count(o));
   }
 
+  // Where the value of the option came from in this parse. Returns
+  // OptionSource::NotProvided for options that were neither given on the
+  // command line nor have a default value, including unknown option names.
+  OptionSource
+  source(const std::string& o) const
+  {
+    auto iter = m_keys.find(o);
+    if (iter == m_keys.end())
+    {
+      return OptionSource::NotProvided;
+    }
+
+    auto viter = m_values.find(iter->second);
+    if (viter == m_values.end())
+    {
+      return OptionSource::NotProvided;
+    }
+
+    return viter->second.source();
+  }
+
   const OptionValue&
   operator[](const std::string& option) const
   {
@@ -2062,7 +2138,7 @@ class OptionParser
   parse(int argc, const char* const* argv);
 
   bool
-  consume_positional(const std::string& a, PositionalListIterator& next);
+  consume_positional(const std::string& a, PositionalListIterator& next, int position = -1);
 
   void
   checked_parse_arg
@@ -2071,18 +2147,22 @@ class OptionParser
     const char* const* argv,
     int& current,
     const std::shared_ptr<OptionDetails>& value,
-    const std::string& name
+    const std::string& name,
+    int offset = -1
   );
 
   void
-  add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg);
+  add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg, int position = -1);
 
   void
   parse_option
   (
     const std::shared_ptr<OptionDetails>& value,
     const std::string& name,
-    const std::string& arg = ""
+    const std::string& arg = "",
+    OptionSource source = OptionSource::CommandLine,
+    int position = -1,
+    int offset = -1
   );
 
   void
@@ -2638,14 +2718,17 @@ OptionParser::parse_option
 (
   const std::shared_ptr<OptionDetails>& value,
   const std::string& /*name*/,
-  const std::string& arg
+  const std::string& arg,
+  OptionSource source,
+  int position,
+  int offset
 )
 {
   auto hash = value->hash();
   auto& result = m_parsed[hash];
-  result.parse(value, arg);
+  result.parse(value, arg, source);
 
-  m_sequential.emplace_back(value->essential_name(), arg);
+  m_sequential.emplace_back(value->essential_name(), arg, position, offset);
 }
 
 inline
@@ -2656,14 +2739,15 @@ OptionParser::checked_parse_arg
   const char* const* argv,
   int& current,
   const std::shared_ptr<OptionDetails>& value,
-  const std::string& name
+  const std::string& name,
+  int offset
 )
 {
   if (current + 1 >= argc)
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(), OptionSource::Implicit, current, offset);
     }
     else
     {
@@ -2674,11 +2758,11 @@ OptionParser::checked_parse_arg
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(), OptionSource::Implicit, current, offset);
     }
     else
     {
-      parse_option(value, name, argv[current + 1]);
+      parse_option(value, name, argv[current + 1], OptionSource::CommandLine, current, offset);
       ++current;
     }
   }
@@ -2686,18 +2770,18 @@ OptionParser::checked_parse_arg
 
 inline
 void
-OptionParser::add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg)
+OptionParser::add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg, int position)
 {
   auto hash = value->hash();
   auto& result = m_parsed[hash];
   result.add(value, arg);
 
-  m_sequential.emplace_back(value->essential_name(), arg);
+  m_sequential.emplace_back(value->essential_name(), arg, position);
 }
 
 inline
 bool
-OptionParser::consume_positional(const std::string& a, PositionalListIterator& next)
+OptionParser::consume_positional(const std::string& a, PositionalListIterator& next, int position)
 {
   while (next != m_positional.end())
   {
@@ -2709,14 +2793,14 @@ OptionParser::consume_positional(const std::string& a, PositionalListIterator& n
         auto& result = m_parsed[iter->second->hash()];
         if (result.count() == 0)
         {
-          add_to_option(iter->second, a);
+          add_to_option(iter->second, a, position);
           ++next;
           return true;
         }
         ++next;
         continue;
       }
-      add_to_option(iter->second, a);
+      add_to_option(iter->second, a, position);
       return true;
     }
     throw_or_mimic<exceptions::no_such_option>(*next);
@@ -2798,7 +2882,7 @@ OptionParser::parse(int argc, const char* const* argv)
 
       //if true is returned here then it was consumed, otherwise it is
       //ignored
-      if (consume_positional(argv[current], next_positional))
+      if (consume_positional(argv[current], next_positional, current))
       {
       }
       else
@@ -2839,20 +2923,20 @@ OptionParser::parse(int argc, const char* const* argv)
               if(value->value().has_disabled_args()){
                 throw_or_mimic<exceptions::specified_disabled_args>(name);
               }
-              parse_option(value, name, argu_desc.value);
+              parse_option(value, name, argu_desc.value, OptionSource::CommandLine, current, static_cast<int>(i));
             }
             else{
-              checked_parse_arg(argc, argv, current, value, name);
+              checked_parse_arg(argc, argv, current, value, name, static_cast<int>(i));
             }
           }
           else if (value->value().has_implicit())
           {
-            parse_option(value, name, value->value().get_implicit_value());
+            parse_option(value, name, value->value().get_implicit_value(), OptionSource::Implicit, current, static_cast<int>(i));
           }
           else if (i + 1 < s.size())
           {
             std::string arg_value = s.substr(i + 1);
-            parse_option(value, name, arg_value);
+            parse_option(value, name, arg_value, OptionSource::CommandLine, current, static_cast<int>(i));
             break;
           }
           else
@@ -2891,7 +2975,7 @@ OptionParser::parse(int argc, const char* const* argv)
           }
           //parse the option given
 
-          parse_option(opt, name, argu_desc.value);
+          parse_option(opt, name, argu_desc.value, OptionSource::CommandLine, current);
         }
         else
         {
@@ -2926,7 +3010,7 @@ OptionParser::parse(int argc, const char* const* argv)
   {
     while (current < argc)
     {
-      if (!consume_positional(argv[current], next_positional)) {
+      if (!consume_positional(argv[current], next_positional, current)) {
         break;
       }
       ++current;

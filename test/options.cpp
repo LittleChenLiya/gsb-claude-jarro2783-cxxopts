@@ -2114,3 +2114,225 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+TEST_CASE("Option value source tracking", "[options][source]")
+{
+  cxxopts::Options options("source_test", " - test value source tracking");
+
+  options.add_options()
+    ("b,bool", "a boolean flag", cxxopts::value<bool>())
+    ("s,string", "a string option", cxxopts::value<std::string>())
+    ("nodefault", "an option without a default", cxxopts::value<std::string>())
+    ;
+
+  SECTION("flag without a value has implicit source, distinct from default")
+  {
+    Argv argv({"source_test", "--bool"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["bool"].as<bool>() == true);
+    CHECK(result.count("bool") == 1);
+    CHECK(result.source("bool") == cxxopts::OptionSource::Implicit);
+    CHECK(result.source("b") == cxxopts::OptionSource::Implicit);
+  }
+
+  SECTION("unset flag has default source")
+  {
+    Argv argv({"source_test"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["bool"].as<bool>() == false);
+    CHECK(result.count("bool") == 0);
+    CHECK(result.source("bool") == cxxopts::OptionSource::Default);
+
+    const auto& defaults = result.defaults();
+    REQUIRE(defaults.size() == 1);
+    CHECK(defaults[0].key() == "bool");
+    CHECK(defaults[0].position() == -1);
+  }
+
+  SECTION("explicit value has command line source")
+  {
+    Argv argv({"source_test", "--bool=false", "--string", "hello"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["bool"].as<bool>() == false);
+    CHECK(result.source("bool") == cxxopts::OptionSource::CommandLine);
+    CHECK(result["string"].as<std::string>() == "hello");
+    CHECK(result.source("string") == cxxopts::OptionSource::CommandLine);
+  }
+
+  SECTION("an empty value is provided, not missing")
+  {
+    Argv argv({"source_test", "--string="});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result.count("string") == 1);
+    CHECK(result.contains("string"));
+    CHECK(result["string"].as<std::string>() == "");
+    CHECK(result.source("string") == cxxopts::OptionSource::CommandLine);
+  }
+
+  SECTION("option without a default that is not given is not provided")
+  {
+    Argv argv({"source_test"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result.count("nodefault") == 0);
+    CHECK(result.source("nodefault") == cxxopts::OptionSource::NotProvided);
+    CHECK(result.source("nonexistent") == cxxopts::OptionSource::NotProvided);
+  }
+
+  SECTION("repeated parse on the same Options keeps no stale source or count")
+  {
+    Argv with_flag({"source_test", "--bool", "--string", "hello"});
+    auto first = options.parse(with_flag.argc(), with_flag.argv());
+
+    CHECK(first.count("bool") == 1);
+    CHECK(first.count("string") == 1);
+    CHECK(first.source("bool") == cxxopts::OptionSource::Implicit);
+    CHECK(first.source("string") == cxxopts::OptionSource::CommandLine);
+    CHECK(first.arguments().size() == 2);
+
+    Argv without_flag({"source_test"});
+    auto second = options.parse(without_flag.argc(), without_flag.argv());
+
+    CHECK(second.count("bool") == 0);
+    CHECK(second.count("string") == 0);
+    CHECK(second.source("bool") == cxxopts::OptionSource::Default);
+    CHECK(second.source("string") == cxxopts::OptionSource::NotProvided);
+    CHECK(second.arguments().empty());
+  }
+}
+
+TEST_CASE("Short option group positions are tracked", "[options][source]")
+{
+  cxxopts::Options options("group", " - track positions in a short option group");
+
+  options.add_options()
+    ("a", "flag a", cxxopts::value<bool>())
+    ("b", "flag b", cxxopts::value<bool>())
+    ("c", "flag c", cxxopts::value<bool>())
+    ;
+
+  Argv argv({"group", "-abc"});
+  auto result = options.parse(argv.argc(), argv.argv());
+
+  const auto& args = result.arguments();
+  REQUIRE(args.size() == 3);
+  CHECK(args[0].key() == "a");
+  CHECK(args[1].key() == "b");
+  CHECK(args[2].key() == "c");
+
+  // every member of "-abc" has a real argv position
+  CHECK(args[0].position() == 1);
+  CHECK(args[1].position() == 1);
+  CHECK(args[2].position() == 1);
+
+  // and its own offset inside the group
+  CHECK(args[0].offset() == 0);
+  CHECK(args[1].offset() == 1);
+  CHECK(args[2].offset() == 2);
+
+  CHECK(result.source("a") == cxxopts::OptionSource::Implicit);
+  CHECK(result.source("b") == cxxopts::OptionSource::Implicit);
+  CHECK(result.source("c") == cxxopts::OptionSource::Implicit);
+}
+
+TEST_CASE("Small compile command with -j1", "[options][source]")
+{
+  cxxopts::Options options("c++", " - a small compile command");
+
+  options.add_options()
+    ("j,jobs", "number of parallel jobs", cxxopts::value<int>())
+    ("o,output", "output file", cxxopts::value<std::string>())
+    ;
+
+  SECTION("attached value in -j1")
+  {
+    Argv argv({"c++", "-j1"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.source("jobs") == cxxopts::OptionSource::CommandLine);
+
+    const auto& args = result.arguments();
+    REQUIRE(args.size() == 1);
+    CHECK(args[0].key() == "jobs");
+    CHECK(args[0].value() == "1");
+    CHECK(args[0].position() == 1);
+    CHECK(args[0].offset() == 0);
+  }
+
+  SECTION("three argv with a separate short option value")
+  {
+    Argv argv({"c++", "-j", "1"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.source("jobs") == cxxopts::OptionSource::CommandLine);
+
+    const auto& args = result.arguments();
+    REQUIRE(args.size() == 1);
+    CHECK(args[0].position() == 1);
+  }
+
+  SECTION("three argv with a long option value")
+  {
+    Argv argv({"c++", "--jobs", "1"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.source("jobs") == cxxopts::OptionSource::CommandLine);
+
+    const auto& args = result.arguments();
+    REQUIRE(args.size() == 1);
+    CHECK(args[0].position() == 1);
+  }
+}
+
+TEST_CASE("Repeated options keep occurrence order and source", "[options][source]")
+{
+  cxxopts::Options options("repeat", " - repeated option handling");
+
+  options.add_options()
+    ("n,num", "numbers", cxxopts::value<std::vector<int>>())
+    ("s,single", "single value", cxxopts::value<std::string>())
+    ;
+
+  SECTION("multi-value options preserve occurrence order")
+  {
+    Argv argv({"repeat", "--num=1", "--num=2", "--num=3"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result["num"].as<std::vector<int>>() == std::vector<int>{1, 2, 3});
+    CHECK(result.count("num") == 3);
+    CHECK(result.source("num") == cxxopts::OptionSource::CommandLine);
+
+    const auto& args = result.arguments();
+    REQUIRE(args.size() == 3);
+    CHECK(args[0].value() == "1");
+    CHECK(args[1].value() == "2");
+    CHECK(args[2].value() == "3");
+    CHECK(args[0].position() == 1);
+    CHECK(args[1].position() == 2);
+    CHECK(args[2].position() == 3);
+  }
+
+  SECTION("single value repeats follow the declared last-wins policy")
+  {
+    Argv argv({"repeat", "--single", "first", "--single", "second"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    CHECK(result.count("single") == 2);
+    CHECK(result["single"].as<std::string>() == "second");
+    CHECK(result.source("single") == cxxopts::OptionSource::CommandLine);
+
+    const auto& args = result.arguments();
+    REQUIRE(args.size() == 2);
+    CHECK(args[0].value() == "first");
+    CHECK(args[0].position() == 1);
+    CHECK(args[1].value() == "second");
+    CHECK(args[1].position() == 3);
+  }
+}

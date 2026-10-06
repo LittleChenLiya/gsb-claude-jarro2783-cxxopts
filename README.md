@@ -200,6 +200,37 @@ though it was given on the command line.
 
 Default values are not counted by `Options::count`.
 
+## Value source and argument positions
+
+`ParseResult` records explicitly where each option's value came from, so you
+don't have to reverse-engineer it from the final string value:
+
+```cpp
+auto result = options.parse(argc, argv);
+result.source("bool"); // a cxxopts::OptionSource
+```
+
+`cxxopts::OptionSource` is one of:
+
+* `NotProvided`: the option was not given on the command line and has no
+  default value.
+* `Default`: the value comes from the declared default value.
+* `Implicit`: the flag was given without a value, so the declared implicit
+  value was used (e.g. `--bool` for a boolean flag).
+* `CommandLine`: the value was explicitly provided on the command line,
+  including an explicitly empty value such as `--opt=`.
+
+For example, `--bool` reports `Implicit`, while the same option left out of
+the command line reports `Default` (boolean options default to `"false"`).
+
+Each entry returned by `ParseResult::arguments()` also tracks where it was
+seen: `position()` is the index in `argv` of the argument, and `offset()` is
+the offset of the option character inside a grouped short-option argument, so
+each of the flags in `-abc` can be located individually.
+
+The source and counts are per parse: calling `Options::parse` again on the
+same `Options` object starts fresh and keeps no state from previous parses.
+
 ### Implicit values with disabled arguments
 
 You can specify an option for which an argument cannot be specified using below syntax.
