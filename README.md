@@ -170,6 +170,34 @@ will result in parsed arguments like the following table:
 | `"server"`    | `"my_server.com"`                         |
 | `"filenames"` | `{"file1.txt", "file2.txt", "file3.txt"}` |
 
+## Explicit binding plans
+
+For finer control over how the command line binds to positional arguments,
+`Options::plan` classifies argv into an explicit `BindingPlan` without running
+any user conversions. Tokens are classified by the real arity of each declared
+option, the `--` terminator, and negative-number lexing, so a token such as
+`-5` is a value rather than an option, and everything after `--` (even
+`--name`) is a plain positional value. Combined short flags keep their data:
+`-j1` binds `1` to `j`.
+
+```cpp
+auto plan = options.plan(argc, argv);
+
+plan.ok();                // true when every token was bound
+plan.options();           // named option bindings (raw values, argv positions)
+plan.positionals();       // positional bindings (raw values, argv positions)
+plan.unknown_options();   // forwarded unknown options, original indices kept
+plan.extra_positionals(); // forwarded extra positionals, original indices kept
+
+// Only a fully bound plan becomes a ParseResult; user conversions run
+// exactly once, here. Throws if the plan forwarded anything.
+auto result = options.commit(plan);
+```
+
+Arity errors (a missing argument, or a value given to an option that takes
+none) throw from `plan` itself, so a malformed command line never produces a
+half-built result. The original `parse` is unaffected.
+
 ## Default and implicit values
 
 An option can be declared with a default or an implicit value, or both.

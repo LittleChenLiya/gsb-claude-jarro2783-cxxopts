@@ -2114,3 +2114,305 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+namespace plan_test {
+
+struct CountedValue
+{
+  int value = 0;
+};
+
+int counted_value_conversions = 0;
+
+} // namespace plan_test
+
+// ADL-found parser for CountedValue; counts every user conversion so the
+// tests can prove planning converts nothing and committing converts once.
+namespace plan_test {
+
+void parse_value(const std::string& text, CountedValue& out)
+{
+  ++counted_value_conversions;
+  out.value = std::stoi(text);
+}
+
+} // namespace plan_test
+
+TEST_CASE("Binding plan binds negative numbers to positional options", "[plan]")
+{
+  cxxopts::Options options("prog", "binding plan tests");
+  options.add_options()
+    ("n,num", "a number", cxxopts::value<int>())
+    ("rest", "the rest", cxxopts::value<std::vector<std::string>>());
+  options.parse_positional({"num", "rest"});
+
+  Argv argv({"prog", "-5", "tail"});
+  auto plan = options.plan(argv.argc(), argv.argv());
+
+  REQUIRE(plan.ok());
+  CHECK(plan.forwarded().empty());
+  REQUIRE(plan.positionals().size() == 2);
+  CHECK(plan.positionals()[0].option == "num");
+  CHECK(plan.positionals()[0].value == "-5");
+  CHECK(plan.positionals()[0].position == 1);
+  CHECK(plan.positionals()[1].option == "rest");
+  CHECK(plan.positionals()[1].value == "tail");
+  CHECK(plan.positionals()[1].position == 2);
+
+  auto result = options.commit(plan);
+  CHECK(result["num"].as<int>() == -5);
+  CHECK(result["rest"].as<std::vector<std::string>>() == std::vector<std::string>{"tail"});
+}
+
+TEST_CASE("Binding plan lexes negative floats as values", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("factor", "a factor", cxxopts::value<double>());
+  options.parse_positional({"factor"});
+
+  Argv argv({"prog", "-2.5"});
+  auto plan = options.plan(argv.argc(), argv.argv());
+
+  REQUIRE(plan.ok());
+  REQUIRE(plan.positionals().size() == 1);
+  CHECK(plan.positionals()[0].value == "-2.5");
+
+  auto result = options.commit(plan);
+  CHECK(result["factor"].as<double>() == -2.5);
+}
+
+TEST_CASE("Binding plan treats tokens after -- as plain values", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("name", "a name", cxxopts::value<std::string>())
+    ("rest", "the rest", cxxopts::value<std::vector<std::string>>());
+  options.parse_positional({"name", "rest"});
+
+  // "--name" after the terminator is an ordinary positional value
+  Argv argv({"prog", "--", "--name", "-x"});
+  auto plan = options.plan(argv.argc(), argv.argv());
+
+  REQUIRE(plan.ok());
+  REQUIRE(plan.positionals().size() == 2);
+  CHECK(plan.positionals()[0].option == "name");
+  CHECK(plan.positionals()[0].value == "--name");
+  CHECK(plan.positionals()[0].position == 2);
+  CHECK(plan.positionals()[1].option == "rest");
+  CHECK(plan.positionals()[1].value == "-x");
+  CHECK(plan.positionals()[1].position == 3);
+
+  auto result = options.commit(plan);
+  CHECK(result["name"].as<std::string>() == "--name");
+  CHECK(result["rest"].as<std::vector<std::string>>() == std::vector<std::string>{"-x"});
+}
+
+TEST_CASE("Binding plan with wrong arity gives no partial result", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("f,flag", "a flag", cxxopts::value<bool>()->default_value("false"))
+    ("c,count", "a count", cxxopts::value<int>());
+
+  // a missing argument aborts the whole plan, even after valid tokens
+  Argv missing({"prog", "-f", "--count"});
+  CHECK_THROWS_AS(
+    options.plan(missing.argc(), missing.argv()),
+    cxxopts::exceptions::missing_argument);
+
+  // same for a short option missing its argument
+  Argv missing_short({"prog", "-c"});
+  CHECK_THROWS_AS(
+    options.plan(missing_short.argc(), missing_short.argv()),
+    cxxopts::exceptions::missing_argument);
+
+  // a value given to an option with disabled args is an arity error too
+  cxxopts::Options disabled("prog");
+  disabled.add_options()
+    ("q,quiet", "no argument allowed",
+     cxxopts::value<bool>()->implicit_value("true", cxxopts::ImplicitArgPolicy::Disabled));
+  Argv gratuitous({"prog", "--quiet=yes"});
+  CHECK_THROWS_AS(
+    disabled.plan(gratuitous.argc(), gratuitous.argv()),
+    cxxopts::exceptions::specified_disabled_args);
+}
+
+TEST_CASE("Binding plan forwards unknown options and extra positionals separately", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("file", "a file", cxxopts::value<std::string>());
+  options.parse_positional({"file"});
+
+  Argv argv({"prog", "--bogus", "one", "two"});
+  auto plan = options.plan(argv.argc(), argv.argv());
+
+  CHECK_FALSE(plan.ok());
+
+  // unknown options and extra positionals are kept apart
+  REQUIRE(plan.unknown_options().size() == 1);
+  CHECK(plan.unknown_options()[0].text == "--bogus");
+  CHECK(plan.unknown_options()[0].position == 1);
+
+  REQUIRE(plan.extra_positionals().size() == 1);
+  CHECK(plan.extra_positionals()[0].text == "two");
+  CHECK(plan.extra_positionals()[0].position == 3);
+
+  // the declared positional still binds, keeping its original position
+  REQUIRE(plan.positionals().size() == 1);
+  CHECK(plan.positionals()[0].option == "file");
+  CHECK(plan.positionals()[0].value == "one");
+  CHECK(plan.positionals()[0].position == 2);
+
+  // forwarded tokens keep their original argv order and indices
+  REQUIRE(plan.forwarded().size() == 2);
+  CHECK(plan.forwarded()[0].text == "--bogus");
+  CHECK(plan.forwarded()[0].position == 1);
+  CHECK(plan.forwarded()[1].text == "two");
+  CHECK(plan.forwarded()[1].position == 3);
+
+  // a plan that did not fully bind never becomes a ParseResult
+  CHECK_THROWS_AS(options.commit(plan), cxxopts::exceptions::no_such_option);
+
+  // extra positionals alone are reported with their own exception
+  Argv extra({"prog", "one", "two"});
+  auto extra_plan = options.plan(extra.argc(), extra.argv());
+  CHECK_FALSE(extra_plan.ok());
+  CHECK(extra_plan.unknown_options().empty());
+  REQUIRE(extra_plan.extra_positionals().size() == 1);
+  CHECK(extra_plan.extra_positionals()[0].position == 2);
+  CHECK_THROWS_AS(options.commit(extra_plan), cxxopts::exceptions::too_many_positionals);
+}
+
+TEST_CASE("Binding plan keeps combined short flags from swallowing data", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("j,jobs", "parallel jobs", cxxopts::value<int>())
+    ("a,all", "all of them", cxxopts::value<bool>()->default_value("false"))
+    ("file", "a file", cxxopts::value<std::string>());
+  options.parse_positional({"file"});
+
+  SECTION("-j1 binds 1 to jobs")
+  {
+    Argv argv({"prog", "-j1"});
+    auto plan = options.plan(argv.argc(), argv.argv());
+
+    REQUIRE(plan.ok());
+    REQUIRE(plan.options().size() == 1);
+    CHECK(plan.options()[0].name == "j");
+    CHECK(plan.options()[0].value == "1");
+    CHECK(plan.options()[0].position == 1);
+
+    auto result = options.commit(plan);
+    CHECK(result["jobs"].as<int>() == 1);
+  }
+
+  SECTION("-j=1 binds 1 to jobs")
+  {
+    Argv argv({"prog", "-j=1"});
+    auto result = options.commit(options.plan(argv.argc(), argv.argv()));
+    CHECK(result["jobs"].as<int>() == 1);
+  }
+
+  SECTION("-aj1 combines a flag with an option value")
+  {
+    Argv argv({"prog", "-aj1"});
+    auto plan = options.plan(argv.argc(), argv.argv());
+
+    REQUIRE(plan.ok());
+    REQUIRE(plan.options().size() == 2);
+    CHECK(plan.options()[0].name == "a");
+    CHECK(plan.options()[1].name == "j");
+    CHECK(plan.options()[1].value == "1");
+
+    auto result = options.commit(plan);
+    CHECK(result["all"].as<bool>() == true);
+    CHECK(result["jobs"].as<int>() == 1);
+  }
+
+  SECTION("four argv entries: -j 1 input.txt")
+  {
+    Argv argv({"prog", "-j", "1", "input.txt"});
+    auto plan = options.plan(argv.argc(), argv.argv());
+
+    REQUIRE(plan.ok());
+    REQUIRE(plan.options().size() == 1);
+    CHECK(plan.options()[0].name == "j");
+    CHECK(plan.options()[0].value == "1");
+    CHECK(plan.options()[0].position == 1);
+    REQUIRE(plan.positionals().size() == 1);
+    CHECK(plan.positionals()[0].value == "input.txt");
+    CHECK(plan.positionals()[0].position == 3);
+
+    auto result = options.commit(plan);
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result["file"].as<std::string>() == "input.txt");
+  }
+
+  SECTION("four argv entries: --jobs 1 -x")
+  {
+    Argv argv({"prog", "--jobs", "1", "-x"});
+    auto plan = options.plan(argv.argc(), argv.argv());
+
+    // "-x" is not declared, so it is forwarded rather than swallowed
+    CHECK_FALSE(plan.ok());
+    REQUIRE(plan.unknown_options().size() == 1);
+    CHECK(plan.unknown_options()[0].text == "-x");
+    CHECK(plan.unknown_options()[0].position == 3);
+  }
+
+  SECTION("four argv entries: --jobs=1 -- --name")
+  {
+    Argv argv({"prog", "--jobs=1", "--", "--name"});
+    auto plan = options.plan(argv.argc(), argv.argv());
+
+    REQUIRE(plan.ok());
+    REQUIRE(plan.positionals().size() == 1);
+    CHECK(plan.positionals()[0].option == "file");
+    CHECK(plan.positionals()[0].value == "--name");
+    CHECK(plan.positionals()[0].position == 3);
+
+    auto result = options.commit(plan);
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result["file"].as<std::string>() == "--name");
+  }
+}
+
+TEST_CASE("Binding plan runs user conversions exactly once", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("n,num", "a number", cxxopts::value<plan_test::CountedValue>());
+
+  plan_test::counted_value_conversions = 0;
+
+  Argv argv({"prog", "--num", "7"});
+  auto plan = options.plan(argv.argc(), argv.argv());
+
+  // planning only classifies tokens, it never converts
+  REQUIRE(plan.ok());
+  CHECK(plan_test::counted_value_conversions == 0);
+
+  auto result = options.commit(plan);
+
+  // committing converts each value exactly once
+  CHECK(plan_test::counted_value_conversions == 1);
+  CHECK(result["num"].as<plan_test::CountedValue>().value == 7);
+}
+
+TEST_CASE("Binding plan leaves the original parse untouched", "[plan]")
+{
+  cxxopts::Options options("prog");
+  options.add_options()
+    ("j,jobs", "parallel jobs", cxxopts::value<int>())
+    ("file", "a file", cxxopts::value<std::string>());
+  options.parse_positional({"file"});
+
+  Argv argv({"prog", "-j1", "input.txt"});
+  auto result = options.parse(argv.argc(), argv.argv());
+
+  CHECK(result["jobs"].as<int>() == 1);
+  CHECK(result["file"].as<std::string>() == "input.txt");
+}

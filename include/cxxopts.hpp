@@ -539,6 +539,18 @@ class option_requires_argument : public parsing
   }
 };
 
+class too_many_positionals : public parsing
+{
+  public:
+  explicit too_many_positionals(const std::string& argument)
+  : parsing(
+      "Positional argument " + LQUOTE + argument + RQUOTE +
+      " has no declared positional option to bind to"
+    )
+  {
+  }
+};
+
 class gratuitous_argument_for_option : public parsing
 {
   public:
@@ -631,6 +643,25 @@ struct ArguDesc {
   bool        set_value = false;
   std::string value     = "";
 };
+
+// Negative-number lexing: a token is a negative number when a '-' is
+// immediately followed by a digit, or by a '.' and a digit. Such tokens
+// are values, not options, so not every leading dash starts an option.
+inline bool IsNegativeNumber(const char* text)
+{
+  if (text == nullptr || text[0] != '-' || text[1] == '\0')
+  {
+    return false;
+  }
+
+  const auto& classic = std::locale::classic();
+  if (std::isdigit(text[1], classic))
+  {
+    return true;
+  }
+
+  return text[1] == '.' && text[2] != '\0' && std::isdigit(text[2], classic);
+}
 
 #ifdef CXXOPTS_NO_REGEX
 inline IntegerDesc SplitInteger(const std::string &text)
@@ -2022,6 +2053,193 @@ CXXOPTS_DIAGNOSTIC_POP
   std::vector<std::string> m_unmatched{};
 };
 
+// The kind of a forwarded argument in a BindingPlan. Unknown options and
+// extra positional arguments are kept apart so callers can diagnose them
+// separately.
+enum class ForwardedKind
+{
+  unknown_option,   // looks like an option but was never declared
+  extra_positional  // plain value with no declared positional slot left
+};
+
+// An argument that could not be bound to any declared option. The original
+// argv index is preserved as-is so forwarded tokens never lose their place.
+struct ForwardedArgument
+{
+  ForwardedArgument() = default;
+
+  ForwardedArgument(ForwardedKind kind_, std::string text_, int position_)
+  : kind(kind_)
+  , text(std::move(text_))
+  , position(position_)
+  {
+  }
+
+  ForwardedKind kind = ForwardedKind::unknown_option;
+  std::string text;   // the argument exactly as it appeared in argv
+  int position = 0;   // the original argv index
+};
+
+// A positional token bound to a declared positional option. The value is
+// the raw, unconverted token text; conversion happens only when the plan
+// is committed.
+struct PositionalBinding
+{
+  PositionalBinding() = default;
+
+  PositionalBinding(std::string option_, std::string value_, int position_)
+  : option(std::move(option_))
+  , value(std::move(value_))
+  , position(position_)
+  {
+  }
+
+  std::string option;   // declared positional option the token binds to
+  std::string value;    // raw, unconverted token text
+  int position = 0;     // the original argv index
+};
+
+// A named option binding planned from the command line. The value is the
+// raw, unconverted text.
+struct OptionBinding
+{
+  OptionBinding() = default;
+
+  OptionBinding(std::string name_, std::string value_, int position_)
+  : name(std::move(name_))
+  , value(std::move(value_))
+  , position(position_)
+  {
+  }
+
+  std::string name;     // option name as given on the command line
+  std::string value;    // raw, unconverted value text
+  int position = 0;     // the original argv index of the option token
+};
+
+// An explicit binding plan for the command line. Planning only classifies
+// tokens -- by real option arity, the `--` terminator, and negative-number
+// lexing -- and never runs user conversions. A plan is converted into a
+// ParseResult exactly once, by Options::commit, and only when every token
+// was bound (ok() is true).
+class BindingPlan
+{
+  public:
+  BindingPlan() = default;
+
+  // True when every token was bound: no unknown options and no extra
+  // positional arguments were forwarded.
+  CXXOPTS_NODISCARD
+  bool
+  ok() const
+  {
+    return m_forwarded.empty();
+  }
+
+  explicit operator bool() const
+  {
+    return ok();
+  }
+
+  CXXOPTS_NODISCARD
+  const std::vector<OptionBinding>&
+  options() const
+  {
+    return m_option_bindings;
+  }
+
+  CXXOPTS_NODISCARD
+  const std::vector<PositionalBinding>&
+  positionals() const
+  {
+    return m_positional_bindings;
+  }
+
+  // All forwarded tokens, in original argv order.
+  CXXOPTS_NODISCARD
+  const std::vector<ForwardedArgument>&
+  forwarded() const
+  {
+    return m_forwarded;
+  }
+
+  CXXOPTS_NODISCARD
+  std::vector<ForwardedArgument>
+  unknown_options() const
+  {
+    return select_forwarded(ForwardedKind::unknown_option);
+  }
+
+  CXXOPTS_NODISCARD
+  std::vector<ForwardedArgument>
+  extra_positionals() const
+  {
+    return select_forwarded(ForwardedKind::extra_positional);
+  }
+
+  private:
+  friend class OptionParser;
+
+  struct PlannedOption
+  {
+    std::shared_ptr<OptionDetails> details;
+    std::string name;
+    std::string value;
+    bool add;
+  };
+
+  std::vector<ForwardedArgument>
+  select_forwarded(ForwardedKind kind) const
+  {
+    std::vector<ForwardedArgument> selected;
+    for (const auto& argument : m_forwarded)
+    {
+      if (argument.kind == kind)
+      {
+        selected.push_back(argument);
+      }
+    }
+    return selected;
+  }
+
+  void
+  plan_option
+  (
+    const std::shared_ptr<OptionDetails>& details,
+    const std::string& name,
+    const std::string& value,
+    int position
+  )
+  {
+    m_planned.push_back(PlannedOption{details, name, value, false});
+    m_option_bindings.push_back(OptionBinding{name, value, position});
+  }
+
+  void
+  plan_positional
+  (
+    const std::shared_ptr<OptionDetails>& details,
+    const std::string& option,
+    const std::string& value,
+    int position
+  )
+  {
+    m_planned.push_back(PlannedOption{details, option, value, true});
+    m_positional_bindings.push_back(PositionalBinding{option, value, position});
+  }
+
+  void
+  forward(const std::string& text, int position, ForwardedKind kind)
+  {
+    m_forwarded.push_back(ForwardedArgument{kind, text, position});
+  }
+
+  std::vector<PlannedOption> m_planned{};
+  std::vector<OptionBinding> m_option_bindings{};
+  std::vector<PositionalBinding> m_positional_bindings{};
+  std::vector<ForwardedArgument> m_forwarded{};
+};
+
 struct Option
 {
   Option
@@ -2061,6 +2279,18 @@ class OptionParser
   ParseResult
   parse(int argc, const char* const* argv);
 
+  // Classify argv into an explicit binding plan without running any user
+  // conversions. Arity errors (a missing argument, or a value given to an
+  // option that takes none) throw immediately, so a wrong-arity command
+  // line never yields a half-built plan.
+  BindingPlan
+  plan(int argc, const char* const* argv) const;
+
+  // Turn a fully bound plan into a ParseResult, running each user
+  // conversion exactly once. Throws unless plan.ok().
+  ParseResult
+  commit(const BindingPlan& plan);
+
   bool
   consume_positional(const std::string& a, PositionalListIterator& next);
 
@@ -2092,6 +2322,16 @@ class OptionParser
   parse_no_value(const std::shared_ptr<OptionDetails>& details);
 
   private:
+
+  void
+  plan_positional
+  (
+    BindingPlan& plan,
+    const std::string& text,
+    int position,
+    PositionalListIterator& next,
+    std::unordered_set<std::size_t>& bound
+  ) const;
 
   void finalise_aliases();
 
@@ -2167,6 +2407,17 @@ class Options
 
   ParseResult
   parse(int argc, const char* const* argv);
+
+  // Build an explicit binding plan for the command line. Planning only
+  // classifies tokens; no user conversion is run. Arity errors throw and
+  // produce no plan at all.
+  BindingPlan
+  plan(int argc, const char* const* argv) const;
+
+  // Commit a fully bound plan to a ParseResult. Every user conversion
+  // runs exactly once, here. Throws unless plan.ok().
+  ParseResult
+  commit(const BindingPlan& plan) const;
 
   OptionAdder
   add_options(std::string group = "");
@@ -2764,6 +3015,24 @@ Options::parse(int argc, const char* const* argv)
   return parser.parse(argc, argv);
 }
 
+inline
+BindingPlan
+Options::plan(int argc, const char* const* argv) const
+{
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+
+  return parser.plan(argc, argv);
+}
+
+inline
+ParseResult
+Options::commit(const BindingPlan& plan) const
+{
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+
+  return parser.commit(plan);
+}
+
 inline ParseResult
 OptionParser::parse(int argc, const char* const* argv)
 {
@@ -2942,6 +3211,251 @@ OptionParser::parse(int argc, const char* const* argv)
   finalise_aliases();
 
   ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched));
+  return parsed;
+}
+
+inline
+void
+OptionParser::plan_positional
+(
+  BindingPlan& plan,
+  const std::string& text,
+  int position,
+  PositionalListIterator& next,
+  std::unordered_set<std::size_t>& bound
+) const
+{
+  while (next != m_positional.end())
+  {
+    auto iter = m_options.find(*next);
+    if (iter != m_options.end())
+    {
+      auto& details = iter->second;
+      if (!details->value().is_container())
+      {
+        if (bound.find(details->hash()) == bound.end())
+        {
+          plan.plan_positional(details, *next, text, position);
+          bound.insert(details->hash());
+          ++next;
+          return;
+        }
+        ++next;
+        continue;
+      }
+      plan.plan_positional(details, *next, text, position);
+      return;
+    }
+    throw_or_mimic<exceptions::no_such_option>(*next);
+  }
+
+  plan.forward(text, position, ForwardedKind::extra_positional);
+}
+
+inline
+BindingPlan
+OptionParser::plan(int argc, const char* const* argv) const
+{
+  BindingPlan result;
+  auto next_positional = m_positional.begin();
+  std::unordered_set<std::size_t> bound;
+  bool consume_remaining = false;
+
+  int current = 1;
+  while (current < argc)
+  {
+    const char* const token = argv[current];
+
+    if (consume_remaining)
+    {
+      // everything after `--` is a plain value
+      plan_positional(result, token, current, next_positional, bound);
+      ++current;
+      continue;
+    }
+
+    if (std::strcmp(token, "--") == 0)
+    {
+      consume_remaining = true;
+      ++current;
+      continue;
+    }
+
+    if (token[0] == '-' && token[1] == '-')
+    {
+      // long option
+      const std::string text(token + 2);
+      const auto equals = text.find('=');
+      const auto name = text.substr(0, equals);
+      const bool has_value = equals != std::string::npos;
+
+      auto iter = m_options.find(name);
+      if (name.empty() || iter == m_options.end())
+      {
+        result.forward(token, current, ForwardedKind::unknown_option);
+        ++current;
+        continue;
+      }
+
+      auto& details = iter->second;
+      if (has_value)
+      {
+        if (details->value().has_disabled_args())
+        {
+          throw_or_mimic<exceptions::specified_disabled_args>(name);
+        }
+        result.plan_option(details, name, text.substr(equals + 1), current);
+      }
+      else if (details->value().has_implicit())
+      {
+        result.plan_option(details, name, details->value().get_implicit_value(), current);
+      }
+      else
+      {
+        // the option requires exactly one argument: the next token
+        if (current + 1 >= argc)
+        {
+          throw_or_mimic<exceptions::missing_argument>(name);
+        }
+        result.plan_option(details, name, argv[current + 1], current);
+        ++current;
+      }
+      bound.insert(details->hash());
+      ++current;
+      continue;
+    }
+
+    if (token[0] == '-' && token[1] != '\0')
+    {
+      // short option group, negative number, or unknown dash token
+      const std::string group(token + 1);
+      if (m_options.find(group.substr(0, 1)) == m_options.end() &&
+          values::parser_tool::IsNegativeNumber(token))
+      {
+        // a negative number is a value, not an option
+        plan_positional(result, token, current, next_positional, bound);
+        ++current;
+        continue;
+      }
+
+      for (std::size_t i = 0; i != group.size(); ++i)
+      {
+        const std::string name(1, group[i]);
+        auto iter = m_options.find(name);
+
+        if (iter == m_options.end())
+        {
+          result.forward("-" + name, current, ForwardedKind::unknown_option);
+          continue;
+        }
+
+        auto& details = iter->second;
+        const auto& value = details->value();
+        std::string rest = group.substr(i + 1);
+        const bool explicit_value = !rest.empty() && rest.front() == '=';
+        if (explicit_value)
+        {
+          rest.erase(rest.begin());
+        }
+
+        if (explicit_value)
+        {
+          if (value.has_disabled_args())
+          {
+            throw_or_mimic<exceptions::specified_disabled_args>(name);
+          }
+          result.plan_option(details, name, rest, current);
+          bound.insert(details->hash());
+          break;
+        }
+
+        if (value.has_implicit())
+        {
+          result.plan_option(details, name, value.get_implicit_value(), current);
+          bound.insert(details->hash());
+          continue;
+        }
+
+        // the option requires an argument
+        if (!rest.empty())
+        {
+          // the remainder of the group is the argument; it is never
+          // reinterpreted as more flags, so combined short flags such as
+          // -j1 bind their data instead of swallowing it
+          result.plan_option(details, name, rest, current);
+          bound.insert(details->hash());
+          break;
+        }
+
+        if (current + 1 >= argc)
+        {
+          throw_or_mimic<exceptions::missing_argument>(name);
+        }
+        result.plan_option(details, name, argv[current + 1], current);
+        bound.insert(details->hash());
+        ++current;
+        break;
+      }
+
+      ++current;
+      continue;
+    }
+
+    // plain value
+    plan_positional(result, token, current, next_positional, bound);
+    ++current;
+  }
+
+  return result;
+}
+
+inline
+ParseResult
+OptionParser::commit(const BindingPlan& plan)
+{
+  if (!plan.ok())
+  {
+    // only a fully bound plan may become a ParseResult
+    const auto& first = plan.forwarded().front();
+    if (first.kind == ForwardedKind::unknown_option)
+    {
+      throw_or_mimic<exceptions::no_such_option>(first.text);
+    }
+    throw_or_mimic<exceptions::too_many_positionals>(first.text);
+  }
+
+  for (const auto& planned : plan.m_planned)
+  {
+    if (planned.add)
+    {
+      add_to_option(planned.details, planned.value);
+    }
+    else
+    {
+      parse_option(planned.details, planned.name, planned.value);
+    }
+  }
+
+  for (auto& opt : m_options)
+  {
+    auto& detail = opt.second;
+    const auto& value = detail->value();
+
+    auto& store = m_parsed[detail->hash()];
+
+    if (value.has_default()) {
+      if (!store.count() && !store.has_default()) {
+        parse_default(detail);
+      }
+    }
+    else {
+      parse_no_value(detail);
+    }
+  }
+
+  finalise_aliases();
+
+  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), {});
   return parsed;
 }
 
