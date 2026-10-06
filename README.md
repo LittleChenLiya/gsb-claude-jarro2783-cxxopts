@@ -158,6 +158,31 @@ Note : `parse_positional` defaults to replacing the positionals with the argumen
 options.parse_positional("another_option", cxxopts::PositionalMode::Append);
 ```
 
+### Planned positional binding
+
+`Options::parse_planned` is an alternative to `parse` that first builds an
+explicit binding plan for the positional arguments and validates the whole
+command line before converting any value:
+
+* tokens are classified using the real arity of the declared options, the
+  `--` terminator and negative number lexing, so a token like `-5` binds to
+  a positional option instead of being treated as an option;
+* `Options::plan_positionals` returns the plan without running any user
+  conversion, recording each binding with its original argv position and
+  reporting unknown options separately from surplus positional arguments;
+* a `ParseResult` is only handed over when everything checks out, and each
+  user conversion runs exactly once.
+
+```cpp
+auto plan = options.plan_positionals(argc, argv);
+plan.bindings();           // planned positional bindings, with argv indices
+plan.unknown_options();    // dash-prefixed tokens that match nothing declared
+plan.extra_positionals();  // positional tokens beyond the declared ones
+plan.complete();           // true when every token could be bound
+
+auto result = options.parse_planned(argc, argv);
+```
+
 For example, parsing the following arguments:
 ~~~
 my_script.py my_server.com file1.txt file2.txt file3.txt

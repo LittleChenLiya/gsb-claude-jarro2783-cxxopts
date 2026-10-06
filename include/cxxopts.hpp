@@ -2022,6 +2022,104 @@ CXXOPTS_DIAGNOSTIC_POP
   std::vector<std::string> m_unmatched{};
 };
 
+// A token from argv recorded together with its original position. Used by
+// PositionalPlan for tokens that could not be bound to anything declared.
+struct UnboundToken
+{
+  UnboundToken() = default;
+
+  UnboundToken(int index, std::string text)
+  : argv_index(index)
+  , text(std::move(text))
+  {
+  }
+
+  int argv_index = 0;
+  std::string text{};
+};
+
+// A single planned binding of an argv token to a declared positional
+// option. The text is the raw, unconverted token taken from argv.
+struct PositionalBinding
+{
+  PositionalBinding() = default;
+
+  PositionalBinding(std::string option, std::string text, int index)
+  : option(std::move(option))
+  , text(std::move(text))
+  , argv_index(index)
+  {
+  }
+
+  std::string option{};
+  std::string text{};
+  int argv_index = 0;
+};
+
+// An explicit binding plan for the positional arguments of a command line.
+//
+// The plan is built by scanning argv with knowledge of the real arity of
+// the declared options, the `--` terminator and negative number lexing, so
+// not every token starting with a dash is treated as an option. Unknown
+// options and surplus positional tokens are recorded separately, each with
+// its original argv position. Building a plan never runs a user conversion.
+class PositionalPlan
+{
+  public:
+  CXXOPTS_NODISCARD
+  const std::vector<PositionalBinding>&
+  bindings() const
+  {
+    return m_bindings;
+  }
+
+  CXXOPTS_NODISCARD
+  const std::vector<UnboundToken>&
+  unknown_options() const
+  {
+    return m_unknown_options;
+  }
+
+  CXXOPTS_NODISCARD
+  const std::vector<UnboundToken>&
+  extra_positionals() const
+  {
+    return m_extra_positionals;
+  }
+
+  // True when every token was bound: no unknown options and no surplus
+  // positional arguments.
+  CXXOPTS_NODISCARD
+  bool
+  complete() const
+  {
+    return m_unknown_options.empty() && m_extra_positionals.empty();
+  }
+
+  void
+  add_binding(PositionalBinding binding)
+  {
+    m_bindings.push_back(std::move(binding));
+  }
+
+  void
+  add_unknown_option(UnboundToken token)
+  {
+    m_unknown_options.push_back(std::move(token));
+  }
+
+  void
+  add_extra_positional(UnboundToken token)
+  {
+    m_extra_positionals.push_back(std::move(token));
+  }
+
+  private:
+  std::vector<PositionalBinding> m_bindings{};
+  std::vector<UnboundToken> m_unknown_options{};
+  std::vector<UnboundToken> m_extra_positionals{};
+};
+
 struct Option
 {
   Option
@@ -2061,6 +2159,18 @@ class OptionParser
   ParseResult
   parse(int argc, const char* const* argv);
 
+  // Build the explicit positional binding plan for the command line
+  // without running any user conversion.
+  PositionalPlan
+  plan_positionals(int argc, const char* const* argv) const;
+
+  // Parse by first building the explicit positional binding plan and
+  // validating the whole command line (real option arity, `--` terminator,
+  // negative number tokens). A ParseResult is only handed over when
+  // everything checks out, and each user conversion runs exactly once.
+  ParseResult
+  parse_planned(int argc, const char* const* argv);
+
   bool
   consume_positional(const std::string& a, PositionalListIterator& next);
 
@@ -2092,6 +2202,30 @@ class OptionParser
   parse_no_value(const std::shared_ptr<OptionDetails>& details);
 
   private:
+
+  // A single option or positional occurrence recorded during the planned
+  // scan, still holding the raw, unconverted token text.
+  struct PlannedAction
+  {
+    int argv_index = 0;
+    std::shared_ptr<OptionDetails> details{};
+    std::string name{};
+    std::string raw{};
+    bool positional = false;
+  };
+
+  static
+  bool
+  looks_like_negative_number(const char* arg);
+
+  void
+  scan_planned
+  (
+    int argc,
+    const char* const* argv,
+    PositionalPlan& plan,
+    std::vector<PlannedAction>& actions
+  ) const;
 
   void finalise_aliases();
 
@@ -2167,6 +2301,22 @@ class Options
 
   ParseResult
   parse(int argc, const char* const* argv);
+
+  // Build the explicit positional binding plan for the command line. The
+  // plan records how positional tokens bind to the declared positional
+  // options (keeping their original argv positions) and reports unknown
+  // options separately from surplus positional tokens. No user conversion
+  // is run while planning.
+  PositionalPlan
+  plan_positionals(int argc, const char* const* argv) const;
+
+  // Parse with an explicit positional binding plan: the command line is
+  // scanned and validated as a whole first (real option arity, `--`
+  // terminator, negative number lexing), and only then are the values
+  // converted, each exactly once. A ParseResult is only handed over when
+  // everything checks out.
+  ParseResult
+  parse_planned(int argc, const char* const* argv);
 
   OptionAdder
   add_options(std::string group = "");
@@ -2762,6 +2912,383 @@ Options::parse(int argc, const char* const* argv)
   OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
 
   return parser.parse(argc, argv);
+}
+
+inline
+PositionalPlan
+Options::plan_positionals(int argc, const char* const* argv) const
+{
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+
+  return parser.plan_positionals(argc, argv);
+}
+
+inline
+ParseResult
+Options::parse_planned(int argc, const char* const* argv)
+{
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+
+  return parser.parse_planned(argc, argv);
+}
+
+inline
+bool
+OptionParser::looks_like_negative_number(const char* arg)
+{
+  // A '-' immediately followed by something that lexes as a number is a
+  // value, not an option: "-5", "-3.14", "-.5", "-0x1F" and so on.
+  if (arg[0] != '-' || arg[1] == '\0')
+  {
+    return false;
+  }
+
+  const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+
+  return digit(arg[1]) || (arg[1] == '.' && arg[2] != '\0' && digit(arg[2]));
+}
+
+inline
+void
+OptionParser::scan_planned
+(
+  int argc,
+  const char* const* argv,
+  PositionalPlan& plan,
+  std::vector<PlannedAction>& actions
+) const
+{
+  const auto record_option =
+    [&actions]
+    (
+      int index,
+      const std::shared_ptr<OptionDetails>& details,
+      const std::string& name,
+      const std::string& raw
+    )
+    {
+      PlannedAction action;
+      action.argv_index = index;
+      action.details = details;
+      action.name = name;
+      action.raw = raw;
+      action.positional = false;
+      actions.push_back(std::move(action));
+    };
+
+  int current = 1;
+  bool consume_remaining = false;
+  std::vector<UnboundToken> positional_tokens;
+
+  while (current < argc)
+  {
+    if (!consume_remaining && strcmp(argv[current], "--") == 0)
+    {
+      // The `--` terminator: everything after it is a plain value, even
+      // when it looks like an option.
+      consume_remaining = true;
+      ++current;
+      continue;
+    }
+
+    if (consume_remaining)
+    {
+      positional_tokens.push_back({current, argv[current]});
+      ++current;
+      continue;
+    }
+
+    const char* const token = argv[current];
+
+    // Negative number lexing: a token such as "-5" or "-3.14" is a value,
+    // not an option, unless its first character names a declared option.
+    if (looks_like_negative_number(token))
+    {
+      const std::string first(1, token[1]);
+      if (m_options.find(first) == m_options.end())
+      {
+        positional_tokens.push_back({current, token});
+        ++current;
+        continue;
+      }
+    }
+
+    bool matched = false;
+    values::parser_tool::ArguDesc argu_desc =
+      values::parser_tool::ParseArgument(token, matched);
+
+    if (!matched)
+    {
+      if (token[0] == '-' && token[1] != '\0')
+      {
+        // A dash-prefixed token that is neither a declared option nor a
+        // negative number: an unknown option, kept apart from the
+        // positional tokens.
+        plan.add_unknown_option({current, token});
+      }
+      else
+      {
+        positional_tokens.push_back({current, token});
+      }
+      ++current;
+      continue;
+    }
+
+    if (argu_desc.grouping)
+    {
+      const std::string& s = argu_desc.arg_name;
+
+      for (std::size_t i = 0; i != s.size(); ++i)
+      {
+        const std::string name(1, s[i]);
+        auto iter = m_options.find(name);
+
+        if (iter == m_options.end())
+        {
+          plan.add_unknown_option({current, std::string("-") + s[i]});
+          continue;
+        }
+
+        const auto& value = iter->second;
+
+        if (i + 1 == s.size())
+        {
+          if (argu_desc.set_value)
+          {
+            if (value->value().has_disabled_args())
+            {
+              throw_or_mimic<exceptions::specified_disabled_args>(name);
+            }
+            record_option(current, value, name, argu_desc.value);
+          }
+          else if (value->value().has_implicit())
+          {
+            // A flag never swallows the following token.
+            record_option(current, value, name, value->value().get_implicit_value());
+          }
+          else
+          {
+            // Real arity: this option requires the next token.
+            if (current + 1 >= argc)
+            {
+              throw_or_mimic<exceptions::missing_argument>(name);
+            }
+            record_option(current, value, name, argv[current + 1]);
+            ++current;
+          }
+        }
+        else if (value->value().has_implicit())
+        {
+          record_option(current, value, name, value->value().get_implicit_value());
+        }
+        else
+        {
+          // An option that requires an argument takes the rest of the
+          // group as its value ("-j1" binds "1" to "j"); it never swallows
+          // the following token.
+          record_option(current, value, name, s.substr(i + 1));
+          break;
+        }
+      }
+    }
+    else if (!argu_desc.arg_name.empty())
+    {
+      const std::string& name = argu_desc.arg_name;
+
+      auto iter = m_options.find(name);
+
+      if (iter == m_options.end())
+      {
+        plan.add_unknown_option({current, token});
+        ++current;
+        continue;
+      }
+
+      const auto& opt = iter->second;
+
+      if (argu_desc.set_value)
+      {
+        if (opt->value().has_disabled_args())
+        {
+          throw_or_mimic<exceptions::specified_disabled_args>(name);
+        }
+        record_option(current, opt, name, argu_desc.value);
+      }
+      else if (opt->value().has_implicit())
+      {
+        record_option(current, opt, name, opt->value().get_implicit_value());
+      }
+      else
+      {
+        // Real arity: this option requires the next token.
+        if (current + 1 >= argc)
+        {
+          throw_or_mimic<exceptions::missing_argument>(name);
+        }
+        record_option(current, opt, name, argv[current + 1]);
+        ++current;
+      }
+    }
+
+    ++current;
+  }
+
+  // Bind the positional tokens to the declared positional options, in
+  // declaration order, keeping the original argv positions.
+  auto next = m_positional.begin();
+  std::unordered_set<std::size_t> bound;
+
+  for (const auto& token : positional_tokens)
+  {
+    bool consumed = false;
+
+    while (next != m_positional.end())
+    {
+      auto iter = m_options.find(*next);
+      if (iter == m_options.end())
+      {
+        throw_or_mimic<exceptions::no_such_option>(*next);
+      }
+
+      const auto& details = iter->second;
+
+      if (!details->value().is_container())
+      {
+        if (bound.count(details->hash()) == 0)
+        {
+          bound.insert(details->hash());
+          plan.add_binding({details->essential_name(), token.text, token.argv_index});
+
+          PlannedAction action;
+          action.argv_index = token.argv_index;
+          action.details = details;
+          action.name = *next;
+          action.raw = token.text;
+          action.positional = true;
+          actions.push_back(std::move(action));
+
+          ++next;
+          consumed = true;
+          break;
+        }
+        ++next;
+        continue;
+      }
+
+      plan.add_binding({details->essential_name(), token.text, token.argv_index});
+
+      PlannedAction action;
+      action.argv_index = token.argv_index;
+      action.details = details;
+      action.name = *next;
+      action.raw = token.text;
+      action.positional = true;
+      actions.push_back(std::move(action));
+
+      consumed = true;
+      break;
+    }
+
+    if (!consumed)
+    {
+      plan.add_extra_positional(token);
+    }
+  }
+}
+
+inline
+PositionalPlan
+OptionParser::plan_positionals(int argc, const char* const* argv) const
+{
+  PositionalPlan plan;
+  std::vector<PlannedAction> actions;
+
+  scan_planned(argc, argv, plan, actions);
+
+  return plan;
+}
+
+inline
+ParseResult
+OptionParser::parse_planned(int argc, const char* const* argv)
+{
+  PositionalPlan plan;
+  std::vector<PlannedAction> actions;
+
+  // Scan and bind first: this validates the real option arity, the `--`
+  // terminator and negative number tokens without running a single user
+  // conversion, so a malformed command line never produces half a result.
+  scan_planned(argc, argv, plan, actions);
+
+  if (!m_allow_unrecognised && !plan.unknown_options().empty())
+  {
+    throw_or_mimic<exceptions::no_such_option>(plan.unknown_options().front().text);
+  }
+
+  // The whole command line checked out. Execute the plan in original argv
+  // order, converting every value exactly once.
+  std::stable_sort(
+    actions.begin(),
+    actions.end(),
+    [](const PlannedAction& a, const PlannedAction& b)
+    {
+      return a.argv_index < b.argv_index;
+    });
+
+  for (const auto& action : actions)
+  {
+    if (action.positional)
+    {
+      add_to_option(action.details, action.raw);
+    }
+    else
+    {
+      parse_option(action.details, action.name, action.raw);
+    }
+  }
+
+  for (auto& opt : m_options)
+  {
+    auto& detail = opt.second;
+    const auto& value = detail->value();
+
+    auto& store = m_parsed[detail->hash()];
+
+    if (value.has_default()) {
+      if (!store.count() && !store.has_default()) {
+        parse_default(detail);
+      }
+    }
+    else {
+      parse_no_value(detail);
+    }
+  }
+
+  // Forward the tokens that could not be bound, preserving their original
+  // positions. Unknown options and surplus positionals stay separate in
+  // the plan, but keep their relative argv order in the unmatched list.
+  std::vector<UnboundToken> forwarded;
+  forwarded.insert(forwarded.end(), plan.unknown_options().begin(), plan.unknown_options().end());
+  forwarded.insert(forwarded.end(), plan.extra_positionals().begin(), plan.extra_positionals().end());
+  std::stable_sort(
+    forwarded.begin(),
+    forwarded.end(),
+    [](const UnboundToken& a, const UnboundToken& b)
+    {
+      return a.argv_index < b.argv_index;
+    });
+
+  std::vector<std::string> unmatched;
+  unmatched.reserve(forwarded.size());
+  for (auto& token : forwarded)
+  {
+    unmatched.push_back(std::move(token.text));
+  }
+
+  finalise_aliases();
+
+  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched));
+  return parsed;
 }
 
 inline ParseResult

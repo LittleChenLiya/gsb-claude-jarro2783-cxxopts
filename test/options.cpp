@@ -2114,3 +2114,325 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+namespace {
+
+// A value type whose user conversion counts how often it runs, used to
+// prove that planned parsing never converts a value twice and does not
+// convert anything at all when the command line is rejected.
+struct CountedValue
+{
+  static int conversions;
+  int value = 0;
+};
+
+int CountedValue::conversions = 0;
+
+std::istream&
+operator>>(std::istream& in, CountedValue& counted)
+{
+  ++CountedValue::conversions;
+  return in >> counted.value;
+}
+
+} // namespace
+
+TEST_CASE("Planned parse binds negative numbers to positionals", "[planned]")
+{
+  cxxopts::Options options("neg", " - negative numbers as positionals");
+
+  options.add_options()
+    ("n,number", "a number", cxxopts::value<int>())
+    ("rest", "the rest", cxxopts::value<std::vector<int>>());
+
+  options.parse_positional({"number", "rest"});
+
+  Argv argv({
+    "neg",
+    "-5",
+    "-7",
+    "3",
+  });
+
+  auto plan = options.plan_positionals(argv.argc(), argv.argv());
+
+  REQUIRE(plan.complete());
+  REQUIRE(plan.bindings().size() == 3);
+  CHECK(plan.bindings()[0].option == "number");
+  CHECK(plan.bindings()[0].text == "-5");
+  CHECK(plan.bindings()[0].argv_index == 1);
+  CHECK(plan.bindings()[1].option == "rest");
+  CHECK(plan.bindings()[1].text == "-7");
+  CHECK(plan.bindings()[1].argv_index == 2);
+  CHECK(plan.bindings()[2].text == "3");
+  CHECK(plan.bindings()[2].argv_index == 3);
+
+  auto result = options.parse_planned(argv.argc(), argv.argv());
+
+  CHECK(result["number"].as<int>() == -5);
+  CHECK(result["rest"].as<std::vector<int>>() == std::vector<int>({-7, 3}));
+}
+
+TEST_CASE("Planned parse prefers a declared option over negative number lexing", "[planned]")
+{
+  cxxopts::Options options("neg", " - declared dash options still win");
+
+  options.add_options()
+    ("6,six", "a short number option")
+    ("number", "a number", cxxopts::value<int>());
+
+  options.parse_positional({"number"});
+
+  Argv argv({
+    "neg",
+    "-6",
+    "-5",
+  });
+
+  auto result = options.parse_planned(argv.argc(), argv.argv());
+
+  CHECK(result.count("six") == 1);
+  CHECK(result["number"].as<int>() == -5);
+}
+
+TEST_CASE("Planned parse treats tokens after -- as plain values", "[planned]")
+{
+  cxxopts::Options options("term", " - double dash terminator");
+
+  options.add_options()
+    ("name", "not this one", cxxopts::value<bool>())
+    ("args", "plain values", cxxopts::value<std::vector<std::string>>());
+
+  options.parse_positional({"args"});
+
+  Argv argv({
+    "term",
+    "--",
+    "--name",
+    "-x",
+  });
+
+  auto plan = options.plan_positionals(argv.argc(), argv.argv());
+
+  REQUIRE(plan.complete());
+  REQUIRE(plan.bindings().size() == 2);
+  CHECK(plan.bindings()[0].text == "--name");
+  CHECK(plan.bindings()[0].argv_index == 2);
+  CHECK(plan.bindings()[1].text == "-x");
+  CHECK(plan.bindings()[1].argv_index == 3);
+
+  auto result = options.parse_planned(argv.argc(), argv.argv());
+
+  CHECK(result.count("name") == 0);
+  CHECK(
+    result["args"].as<std::vector<std::string>>() ==
+    std::vector<std::string>({"--name", "-x"}));
+}
+
+TEST_CASE("Planned parse validates arity before running any conversion", "[planned]")
+{
+  cxxopts::Options options("arity", " - wrong arity yields no partial result");
+
+  options.add_options()
+    ("count", "a counted value", cxxopts::value<CountedValue>())
+    ("other", "another counted value", cxxopts::value<CountedValue>());
+
+  SECTION("missing required argument throws and converts nothing")
+  {
+    CountedValue::conversions = 0;
+
+    Argv argv({
+      "arity",
+      "--count",
+    });
+
+    CHECK_THROWS_AS(
+      options.parse_planned(argv.argc(), argv.argv()),
+      cxxopts::exceptions::missing_argument);
+    CHECK(CountedValue::conversions == 0);
+  }
+
+  SECTION("a later arity error rejects the whole command line")
+  {
+    CountedValue::conversions = 0;
+
+    Argv argv({
+      "arity",
+      "--count",
+      "5",
+      "--other",
+    });
+
+    CHECK_THROWS_AS(
+      options.parse_planned(argv.argc(), argv.argv()),
+      cxxopts::exceptions::missing_argument);
+    // No half-parsed result: the valid option was not converted either.
+    CHECK(CountedValue::conversions == 0);
+  }
+
+  SECTION("each user conversion runs exactly once")
+  {
+    CountedValue::conversions = 0;
+
+    Argv argv({
+      "arity",
+      "--count",
+      "5",
+    });
+
+    auto result = options.parse_planned(argv.argc(), argv.argv());
+
+    CHECK(CountedValue::conversions == 1);
+    CHECK(result["count"].as<CountedValue>().value == 5);
+  }
+}
+
+TEST_CASE("Planned parse keeps unknown options and extra positionals apart", "[planned]")
+{
+  cxxopts::Options options("forward", " - forward unbound tokens in place");
+
+  options.add_options()
+    ("first", "the one positional", cxxopts::value<std::string>());
+
+  options.parse_positional({"first"});
+  options.allow_unrecognised_options();
+
+  Argv argv({
+    "forward",
+    "a",
+    "b",
+    "--mystery",
+    "c",
+    "-z",
+  });
+
+  auto plan = options.plan_positionals(argv.argc(), argv.argv());
+
+  CHECK_FALSE(plan.complete());
+
+  REQUIRE(plan.bindings().size() == 1);
+  CHECK(plan.bindings()[0].option == "first");
+  CHECK(plan.bindings()[0].text == "a");
+  CHECK(plan.bindings()[0].argv_index == 1);
+
+  // Unknown options and surplus positionals are reported separately, each
+  // with its original argv position.
+  REQUIRE(plan.unknown_options().size() == 2);
+  CHECK(plan.unknown_options()[0].text == "--mystery");
+  CHECK(plan.unknown_options()[0].argv_index == 3);
+  CHECK(plan.unknown_options()[1].text == "-z");
+  CHECK(plan.unknown_options()[1].argv_index == 5);
+
+  REQUIRE(plan.extra_positionals().size() == 2);
+  CHECK(plan.extra_positionals()[0].text == "b");
+  CHECK(plan.extra_positionals()[0].argv_index == 2);
+  CHECK(plan.extra_positionals()[1].text == "c");
+  CHECK(plan.extra_positionals()[1].argv_index == 4);
+
+  auto result = options.parse_planned(argv.argc(), argv.argv());
+
+  CHECK(result["first"].as<std::string>() == "a");
+
+  // Forwarded tokens keep their original relative order.
+  CHECK(
+    result.unmatched() ==
+    std::vector<std::string>({"b", "--mystery", "c", "-z"}));
+}
+
+TEST_CASE("Planned parse rejects unknown options unless allowed", "[planned]")
+{
+  cxxopts::Options options("strict", " - unknown options are not positionals");
+
+  options.add_options()
+    ("first", "the one positional", cxxopts::value<std::string>());
+
+  options.parse_positional({"first"});
+
+  Argv argv({
+    "strict",
+    "value",
+    "--mystery",
+  });
+
+  auto plan = options.plan_positionals(argv.argc(), argv.argv());
+
+  CHECK_FALSE(plan.complete());
+  REQUIRE(plan.unknown_options().size() == 1);
+  CHECK(plan.unknown_options()[0].text == "--mystery");
+  CHECK(plan.unknown_options()[0].argv_index == 2);
+  CHECK(plan.extra_positionals().empty());
+
+  CHECK_THROWS_AS(
+    options.parse_planned(argv.argc(), argv.argv()),
+    cxxopts::exceptions::no_such_option);
+}
+
+TEST_CASE("Planned parse handles grouped short flags without swallowing data", "[planned]")
+{
+  cxxopts::Options options("build", " - grouped short flags");
+
+  options.add_options()
+    ("j,jobs", "parallel jobs", cxxopts::value<int>())
+    ("v,verbose", "verbose output", cxxopts::value<bool>()->implicit_value("true"))
+    ("output", "output file", cxxopts::value<std::string>());
+
+  options.parse_positional({"output"});
+
+  SECTION("-j1 binds 1 to j")
+  {
+    Argv argv({
+      "build",
+      "-j1",
+      "out.o",
+    });
+
+    auto result = options.parse_planned(argv.argc(), argv.argv());
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result["output"].as<std::string>() == "out.o");
+  }
+
+  SECTION("four argv: -j takes the next token as its value")
+  {
+    Argv argv({
+      "build",
+      "-j",
+      "4",
+      "out.o",
+    });
+
+    auto result = options.parse_planned(argv.argc(), argv.argv());
+
+    CHECK(result["jobs"].as<int>() == 4);
+    CHECK(result["output"].as<std::string>() == "out.o");
+  }
+
+  SECTION("a flag in a group does not swallow the following token")
+  {
+    Argv argv({
+      "build",
+      "-v",
+      "out.o",
+    });
+
+    auto result = options.parse_planned(argv.argc(), argv.argv());
+
+    CHECK(result["verbose"].as<bool>() == true);
+    CHECK(result["output"].as<std::string>() == "out.o");
+  }
+
+  SECTION("mixed group: flag plus option with attached value")
+  {
+    Argv argv({
+      "build",
+      "-vj1",
+      "out.o",
+    });
+
+    auto result = options.parse_planned(argv.argc(), argv.argv());
+
+    CHECK(result["verbose"].as<bool>() == true);
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result["output"].as<std::string>() == "out.o");
+  }
+}
