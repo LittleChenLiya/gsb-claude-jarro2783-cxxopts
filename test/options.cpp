@@ -2114,3 +2114,264 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+TEST_CASE("Explicit value source information", "[source]")
+{
+  using cxxopts::ValueSource;
+
+  cxxopts::Options options("sources", "explicit source tracking");
+  options.add_options()
+    ("bool", "a boolean")
+    ("i,intval", "an int", cxxopts::value<int>()->default_value("7"))
+    ("s,str", "a string",
+      cxxopts::value<std::string>()
+        ->implicit_value("implicit")->default_value("def"))
+    ("n,num", "a scalar without an implicit value",
+      cxxopts::value<int>())
+    ("l,list", "a list", cxxopts::value<std::vector<int>>());
+
+  SECTION("Bare flag uses implicit source, not default")
+  {
+    Argv av({"sources", "--bool"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["bool"].as<bool>() == true);
+    CHECK(result.source("bool") == ValueSource::Implicit);
+    CHECK(result.occurrences("bool").size() == 1);
+    CHECK(result.occurrences("bool")[0].source == ValueSource::Implicit);
+    CHECK(result.occurrences("bool")[0].raw_value == "true");
+    CHECK(result.occurrences("bool")[0].argv_index == 1u);
+    CHECK(result.occurrences("bool")[0].offset == 2u);
+  }
+
+  SECTION("Unmentioned bool keeps default source even though value is false")
+  {
+    Argv av({"sources"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["bool"].as<bool>() == false);
+    CHECK(result.source("bool") == ValueSource::Default);
+    CHECK(result.count("bool") == 0u);
+    const auto& occurrences = result.occurrences("bool");
+    REQUIRE(occurrences.size() == 1);
+    CHECK(occurrences[0].source == ValueSource::Default);
+    CHECK(occurrences[0].raw_value == "false");
+    CHECK(occurrences[0].argv_index == cxxopts::OptionOccurrence::npos);
+    CHECK(occurrences[0].offset == cxxopts::OptionOccurrence::npos);
+  }
+
+  SECTION("Explicit false on the command line is not a default")
+  {
+    Argv av({"sources", "--bool=false"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["bool"].as<bool>() == false);
+    CHECK(result.source("bool") == ValueSource::CommandLine);
+    CHECK(result.occurrences("bool")[0].raw_value == "false");
+  }
+
+  SECTION("Bare implicit-valued string uses implicit source")
+  {
+    Argv av({"sources", "--str"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["str"].as<std::string>() == "implicit");
+    CHECK(result.source("str") == ValueSource::Implicit);
+  }
+
+  SECTION("Empty explicit value is provided, not missing and not default")
+  {
+    Argv av({"sources", "--str="});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result.count("str") == 1u);
+    CHECK(result["str"].as<std::string>() == "");
+    CHECK(result.source("str") == ValueSource::CommandLine);
+    const auto& occurrences = result.occurrences("str");
+    REQUIRE(occurrences.size() == 1);
+    CHECK(occurrences[0].raw_value == "");
+    CHECK(occurrences[0].argv_index == 1u);
+  }
+
+  SECTION("Defaults list and sequential arguments carry their sources")
+  {
+    Argv av({"sources", "--bool"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    REQUIRE(result.arguments().size() == 1);
+    CHECK(result.arguments()[0].key() == "bool");
+    CHECK(result.arguments()[0].source() == ValueSource::Implicit);
+    CHECK(result.arguments()[0].argv_index() == 1u);
+    CHECK(result.arguments()[0].offset() == 2u);
+
+    bool found_int = false;
+    for (const auto& kv : result.defaults())
+    {
+      CHECK(kv.source() == ValueSource::Default);
+      CHECK(kv.argv_index() == cxxopts::OptionOccurrence::npos);
+      if (kv.key() == "intval")
+      {
+        found_int = true;
+        CHECK(kv.as<int>() == 7);
+      }
+    }
+    CHECK(found_int);
+  }
+
+  SECTION("Repeated multi-values keep order of occurrence with positions")
+  {
+    Argv av({"sources", "--list", "3", "-l1", "--list=2"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    const auto& occurrences = result.occurrences("list");
+    REQUIRE(occurrences.size() == 3);
+    CHECK(occurrences[0].raw_value == "3");
+    CHECK(occurrences[0].source == ValueSource::CommandLine);
+    CHECK(occurrences[0].argv_index == 1u);
+    CHECK(occurrences[0].offset == 2u);
+    CHECK(occurrences[1].raw_value == "1");
+    CHECK(occurrences[1].argv_index == 3u);
+    CHECK(occurrences[1].offset == 1u);
+    CHECK(occurrences[2].raw_value == "2");
+    CHECK(occurrences[2].argv_index == 4u);
+    CHECK(occurrences[2].offset == 2u);
+
+    const auto values = result["list"].as<std::vector<int>>();
+    REQUIRE(values.size() == 3);
+    CHECK(values[0] == 3);
+    CHECK(values[1] == 1);
+    CHECK(values[2] == 2);
+  }
+
+  SECTION("Repeated single value: last wins but every occurrence is recorded")
+  {
+    Argv av({"sources", "-n", "1", "--num=2"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["num"].as<int>() == 2);
+    CHECK(result.count("num") == 2u);
+    CHECK(result.source("num") == ValueSource::CommandLine);
+    const auto& occurrences = result.occurrences("num");
+    REQUIRE(occurrences.size() == 2);
+    CHECK(occurrences[0].raw_value == "1");
+    CHECK(occurrences[0].argv_index == 1u);
+    CHECK(occurrences[0].offset == 1u);
+    CHECK(occurrences[1].raw_value == "2");
+    CHECK(occurrences[1].argv_index == 3u);
+    CHECK(occurrences[1].offset == 2u);
+  }
+
+  SECTION("Grouped short options have real, distinct positions")
+  {
+    Argv av({"sources", "-abc"});
+    cxxopts::Options grouped("grouped");
+    grouped.add_options()("a", "")("b", "")("c,ccc", "");
+    auto result = grouped.parse(av.argc(), av.argv());
+
+    const auto& oa = result.occurrences("a");
+    const auto& ob = result.occurrences("b");
+    const auto& oc = result.occurrences("ccc");
+    REQUIRE(oa.size() == 1);
+    REQUIRE(ob.size() == 1);
+    REQUIRE(oc.size() == 1);
+    CHECK(oa[0].argv_index == 1u);
+    CHECK(oa[0].offset == 1u);
+    CHECK(ob[0].argv_index == 1u);
+    CHECK(ob[0].offset == 2u);
+    CHECK(oc[0].argv_index == 1u);
+    CHECK(oc[0].offset == 3u);
+    CHECK(oa[0].source == ValueSource::Implicit);
+    CHECK(ob[0].source == ValueSource::Implicit);
+    CHECK(oc[0].source == ValueSource::Implicit);
+  }
+
+  SECTION("Repeated parses do not leak sources or counts")
+  {
+    Argv first({"sources", "--bool", "--str=explicit", "-l", "9"});
+    auto r1 = options.parse(first.argc(), first.argv());
+    CHECK(r1.count("bool") == 1u);
+    CHECK(r1.source("bool") == ValueSource::Implicit);
+    CHECK(r1.source("str") == ValueSource::CommandLine);
+    CHECK(r1.occurrences("list").size() == 1u);
+
+    Argv second({"sources", "--intval", "11", "--num=5"});
+    auto r2 = options.parse(second.argc(), second.argv());
+    CHECK(r2.count("bool") == 0u);
+    CHECK(r2.source("bool") == ValueSource::Default);
+    CHECK(r2.occurrences("bool").size() == 1u);
+    CHECK(r2.occurrences("bool")[0].source == ValueSource::Default);
+    CHECK(r2.source("str") == ValueSource::Default);
+    CHECK(r2.occurrences("list").size() == 0u);
+    CHECK(r2.source("num") == ValueSource::CommandLine);
+    CHECK(r2.arguments().size() == 2u);
+    CHECK(r2.source("intval") == ValueSource::CommandLine);
+    CHECK(r2["intval"].as<int>() == 11);
+    CHECK(r2["num"].as<int>() == 5);
+  }
+}
+
+TEST_CASE("Attached short option argument j1 records command line source",
+  "[source]")
+{
+  cxxopts::Options options("make_like", "small command");
+  options.add_options()
+    ("j,jobs", "parallel jobs", cxxopts::value<int>())
+    ("k,keep", "a boolean flag");
+
+  SECTION("Value attached directly to short option")
+  {
+    Argv av({"make_like", "-j1"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.count("jobs") == 1u);
+    CHECK(result.source("jobs") == cxxopts::ValueSource::CommandLine);
+    const auto& occurrences = result.occurrences("j");
+    REQUIRE(occurrences.size() == 1);
+    CHECK(occurrences[0].raw_value == "1");
+    CHECK(occurrences[0].argv_index == 1u);
+    CHECK(occurrences[0].offset == 1u);
+  }
+
+  SECTION("Attached value followed by a grouped boolean")
+  {
+    Argv av({"make_like", "-j4", "-k"});
+    auto result = options.parse(av.argc(), av.argv());
+
+    CHECK(result["jobs"].as<int>() == 4);
+    CHECK(result.source("jobs") == cxxopts::ValueSource::CommandLine);
+    CHECK(result.source("keep") == cxxopts::ValueSource::Implicit);
+    CHECK(result.occurrences("keep")[0].offset == 1u);
+    CHECK(result.occurrences("keep")[0].argv_index == 2u);
+  }
+}
+
+TEST_CASE("Three argv elements: program, flag and value", "[source]")
+{
+  cxxopts::Options options("three_argv", "three argument vector");
+  options.add_options()
+    ("j,jobs", "jobs", cxxopts::value<int>());
+
+  SECTION("Attached form in a three element argv")
+  {
+    const char* argv[] = {"three_argv", "-j1", nullptr};
+    auto result = options.parse(2, argv);
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.source("jobs") == cxxopts::ValueSource::CommandLine);
+  }
+
+  SECTION("Separate form in a three element argv")
+  {
+    const char* argv[] = {"three_argv", "-j", "1", nullptr};
+    auto result = options.parse(3, argv);
+
+    CHECK(result["jobs"].as<int>() == 1);
+    CHECK(result.source("jobs") == cxxopts::ValueSource::CommandLine);
+    const auto& occurrences = result.occurrences("jobs");
+    REQUIRE(occurrences.size() == 1);
+    CHECK(occurrences[0].raw_value == "1");
+    CHECK(occurrences[0].argv_index == 1u);
+    CHECK(occurrences[0].offset == 1u);
+  }
+}

@@ -279,6 +279,62 @@ options.add_options()
   ("use", "Usable means of transport", cxxopts::value<std::vector<std::string>>())
 ~~~
 
+## Where a value came from
+
+The source of a value is recorded explicitly while parsing; it is never
+inferred from the resulting string. Ask a result for the `ValueSource` of an
+option:
+
+```cpp
+result.source("option")
+```
+
+which returns one of:
+
+* `cxxopts::ValueSource::None` &ndash; the option was not mentioned and has no
+  default value;
+* `cxxopts::ValueSource::Default` &ndash; the declared default value was used
+  because the option was not specified;
+* `cxxopts::ValueSource::Implicit` &ndash; the flag was supplied without an
+  argument, so its implicit value was used (a bare `--bool` for a boolean);
+* `cxxopts::ValueSource::CommandLine` &ndash; a value was given explicitly,
+  including an empty one (`--option=`), an attached short-option value
+  (`-j1`), or a positional argument.
+
+This means an explicitly provided `--bool=false` is distinguishable from the
+default value `false`. An empty value (`--option=`) counts as provided and is
+not confused with a missing option or the default.
+
+Every appearance of an option is kept, in order of appearance, with the raw
+value text and its exact position in `argv`:
+
+```cpp
+for (const auto& occ : result.occurrences("option"))
+{
+  occ.source;       // ValueSource for this appearance
+  occ.raw_value;    // the exact text consumed ("" for --option=)
+  occ.argv_index;   // argv element containing the flag (program name is 0)
+  occ.offset;       // offset of the option char in that element
+}
+```
+
+For grouped short options such as `-abc`, the positions are real and
+distinct: `a` is at `argv_index` 1, `offset` 1, `b` at offset 2 and `c` at
+offset 3. Long options are at offset 2. Default-valued appearances use
+`OptionOccurrence::npos` for both positions.
+
+For multi-valued (container) options the appearances follow the order of
+occurrence. A single-valued option given repeatedly keeps all appearances but
+stores the last value; `source()` then reports the source of that effective
+(last) value.
+
+Each entry returned by `result.arguments()` and `result.defaults()` also
+exposes `source()`, `argv_index()` and `offset()`.
+
+Repeated calls to `parse` on the same `Options` object are independent: every
+parse builds a fresh result, so sources, counts and appearances from a
+previous parse never leak into the next one.
+
 ## Custom help
 
 `options.custom_help(text)` replaces the option synopsis after the program

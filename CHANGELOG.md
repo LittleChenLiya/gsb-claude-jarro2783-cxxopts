@@ -3,6 +3,22 @@
 This is the changelog for `cxxopts`, a C++11 library for parsing command line
 options. The project adheres to semantic versioning.
 
+## Unreleased
+
+### Added
+
+* Explicit value source information on `ParseResult`:
+  `ParseResult::source(name)` returns a `ValueSource` (`None`, `Default`,
+  `Implicit`, or `CommandLine`), and `ParseResult::occurrences(name)` returns
+  every appearance in order of occurrence with its raw value and exact `argv`
+  position (`argv_index`, `offset`). The source is recorded while parsing,
+  never inferred from the resulting string, so a bare `--bool` (implicit
+  `true`), `--bool=false` (command line) and an unset boolean (default
+  `false`) are all distinguishable. Empty values such as `--option=` are
+  recorded as provided with an empty raw value. `KeyValue` exposes the same
+  information through `source()`, `argv_index()` and `offset()`. Repeated
+  parses on one `Options` object no longer carry sources or counts over.
+
 ## 3.3.1
 
 ### Bug fixes

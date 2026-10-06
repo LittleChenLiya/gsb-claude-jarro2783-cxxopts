@@ -1653,6 +1653,77 @@ struct HelpGroupDetails
   std::vector<HelpOptionDetails> options{};
 };
 
+// Describes where the value of an option came from. The source is recorded
+// explicitly while parsing; it is never inferred from the resulting value
+// string (so e.g. an explicitly passed `--bool=false` is distinguishable from
+// the default value "false").
+enum class ValueSource {
+  // The option was never mentioned and has no default value.
+  None,
+  // The value is the declared default value (option was not on the command
+  // line).
+  Default,
+  // The flag was supplied without an argument, so the declared implicit value
+  // was used (e.g. `--bool`, `-b` or `-abc` for a boolean).
+  Implicit,
+  // The value was explicitly given on the command line, either attached to
+  // the flag (`-j1`, `--foo=bar`, `-abc` tail), as the following argv
+  // element (`--foo bar`), or as a positional argument.
+  CommandLine
+};
+
+// A single recorded appearance of an option during a parse, together with
+// exactly where in argv it appeared. Every appearance is appended in order,
+// so for multi-valued (container) options the records follow the order of
+// occurrence and the raw values need not be unique.
+struct OptionOccurrence
+{
+  static constexpr std::size_t npos =
+    (std::numeric_limits<std::size_t>::max)();
+
+  OptionOccurrence() = default;
+
+  OptionOccurrence
+  (
+    ValueSource source_,
+    std::string raw_value_,
+    std::size_t argv_index_ = npos,
+    std::size_t offset_ = npos
+  )
+  : source(source_)
+  , raw_value(std::move(raw_value_))
+  , argv_index(argv_index_)
+  , offset(offset_)
+  {
+  }
+
+  // How this value was provided.
+  ValueSource source = ValueSource::None;
+  // The exact text consumed for this appearance (implicit and default values
+  // included). An explicitly provided empty argument stays empty here.
+  std::string raw_value{};
+  // Index of the argv element that contained the option (the program name is
+  // index 0). npos for default values.
+  std::size_t argv_index = npos;
+  // Offset of the option character inside that argv element. For grouped
+  // short options such as `-abc`, `a` is at offset 1, `b` at 2 and `c` at 3;
+  // long options are at offset 2; npos for default values.
+  std::size_t offset = npos;
+};
+
+// In C++11/14 the static constexpr member needs a definition when it is
+// odr-used. Keep the definition weak/select-any so this header-only library
+// can be included by multiple translation units; C++17 makes it implicitly
+// inline.
+#if __cplusplus < 201703L
+#  if defined(_MSC_VER) || (defined(__GNUC__) && defined(_WIN32))
+__declspec(selectany)
+#  elif defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#  endif
+constexpr std::size_t OptionOccurrence::npos;
+#endif
+
 class OptionValue
 {
   public:
@@ -1660,26 +1731,30 @@ class OptionValue
   add
   (
     const std::shared_ptr<const OptionDetails>& details,
-    const std::string& text
+    const std::string& text,
+    const OptionOccurrence& occurrence
   )
   {
     ensure_value(details);
     ++m_count;
     m_value->add(text);
     m_long_names = &details->long_names();
+    record(occurrence);
   }
 
   void
   parse
   (
     const std::shared_ptr<const OptionDetails>& details,
-    const std::string& text
+    const std::string& text,
+    const OptionOccurrence& occurrence
   )
   {
     ensure_value(details);
     ++m_count;
     m_value->parse(text);
     m_long_names = &details->long_names();
+    record(occurrence);
   }
 
   void
@@ -1689,6 +1764,12 @@ class OptionValue
     m_default = true;
     m_long_names = &details->long_names();
     m_value->parse();
+    // The default is recorded as an explicit source, rather than being
+    // inferred from the parsed value (which may equal it, e.g. "false").
+    m_occurrences.emplace_back(
+      ValueSource::Default,
+      details->value().get_default_value()
+    );
   }
 
   void
@@ -1719,6 +1800,31 @@ CXXOPTS_DIAGNOSTIC_POP
   has_default() const noexcept
   {
     return m_default;
+  }
+
+  // Source of the effective value: the source of the last recorded
+  // appearance, in line with the last-write-wins storage policy for
+  // single-valued options. Inspect occurrences() for the source of every
+  // individual appearance (e.g. of multi-valued container options).
+  CXXOPTS_NODISCARD
+  ValueSource
+  source() const noexcept
+  {
+    if (m_occurrences.empty())
+    {
+      return ValueSource::None;
+    }
+    return m_occurrences.back().source;
+  }
+
+  // Every appearance of the option, in the order in which it occurred. The
+  // records carry the raw value text and the exact argv position. A default
+  // value contributes exactly one record with ValueSource::Default.
+  CXXOPTS_NODISCARD
+  const std::vector<OptionOccurrence>&
+  occurrences() const noexcept
+  {
+    return m_occurrences;
   }
 
   template <typename T>
@@ -1755,6 +1861,11 @@ CXXOPTS_DIAGNOSTIC_POP
     }
   }
 
+  void
+  record(const OptionOccurrence& occurrence)
+  {
+    m_occurrences.push_back(occurrence);
+  }
 
   const OptionNames * m_long_names = nullptr;
   // Holding this pointer is safe, since OptionValue's only exist in key-value pairs,
@@ -1762,6 +1873,7 @@ CXXOPTS_DIAGNOSTIC_POP
   std::shared_ptr<Value> m_value{};
   std::size_t m_count = 0;
   bool m_default = false;
+  std::vector<OptionOccurrence> m_occurrences{};
 };
 
 class KeyValue
@@ -1770,6 +1882,22 @@ class KeyValue
   KeyValue(std::string key_, std::string value_) noexcept
   : m_key(std::move(key_))
   , m_value(std::move(value_))
+  {
+  }
+
+  KeyValue
+  (
+    std::string key_,
+    std::string value_,
+    ValueSource source_,
+    std::size_t argv_index_,
+    std::size_t offset_
+  ) noexcept
+  : m_key(std::move(key_))
+  , m_value(std::move(value_))
+  , m_source(source_)
+  , m_argv_index(argv_index_)
+  , m_offset(offset_)
   {
   }
 
@@ -1787,6 +1915,32 @@ class KeyValue
     return m_value;
   }
 
+  // Where this recorded value came from.
+  CXXOPTS_NODISCARD
+  ValueSource
+  source() const noexcept
+  {
+    return m_source;
+  }
+
+  // Index of the argv element containing the option, or
+  // OptionOccurrence::npos for a default value.
+  CXXOPTS_NODISCARD
+  std::size_t
+  argv_index() const noexcept
+  {
+    return m_argv_index;
+  }
+
+  // Offset of the option character within that argv element, or
+  // OptionOccurrence::npos for a default value.
+  CXXOPTS_NODISCARD
+  std::size_t
+  offset() const noexcept
+  {
+    return m_offset;
+  }
+
   template <typename T>
   T
   as() const
@@ -1799,6 +1953,9 @@ class KeyValue
   private:
   std::string m_key;
   std::string m_value;
+  ValueSource m_source = ValueSource::None;
+  std::size_t m_argv_index = OptionOccurrence::npos;
+  std::size_t m_offset = OptionOccurrence::npos;
 };
 
 using ParsedHashMap = std::unordered_map<std::size_t, OptionValue>;
@@ -1943,6 +2100,22 @@ CXXOPTS_DIAGNOSTIC_POP
     return static_cast<bool>(count(o));
   }
 
+  // Explicit source of the effective value of the option (flag-provided,
+  // implicit, default, or none). Throws if the option name is unknown.
+  ValueSource
+  source(const std::string& o) const
+  {
+    return (*this)[o].source();
+  }
+
+  // Every recorded appearance of the option in order, with its explicit
+  // source and argv position. Throws if the option name is unknown.
+  const std::vector<OptionOccurrence>&
+  occurrences(const std::string& o) const
+  {
+    return (*this)[o].occurrences();
+  }
+
   const OptionValue&
   operator[](const std::string& option) const
   {
@@ -2062,7 +2235,12 @@ class OptionParser
   parse(int argc, const char* const* argv);
 
   bool
-  consume_positional(const std::string& a, PositionalListIterator& next);
+  consume_positional
+  (
+    const std::string& a,
+    PositionalListIterator& next,
+    std::size_t argv_index
+  );
 
   void
   checked_parse_arg
@@ -2071,18 +2249,25 @@ class OptionParser
     const char* const* argv,
     int& current,
     const std::shared_ptr<OptionDetails>& value,
-    const std::string& name
+    const std::string& name,
+    std::size_t offset
   );
 
   void
-  add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg);
+  add_to_option
+  (
+    const std::shared_ptr<OptionDetails>& value,
+    const std::string& arg,
+    const OptionOccurrence& occurrence
+  );
 
   void
   parse_option
   (
     const std::shared_ptr<OptionDetails>& value,
     const std::string& name,
-    const std::string& arg = ""
+    const std::string& arg,
+    const OptionOccurrence& occurrence
   );
 
   void
@@ -2621,7 +2806,13 @@ OptionParser::parse_default(const std::shared_ptr<OptionDetails>& details)
   // TODO: remove the duplicate code here
   auto& store = m_parsed[details->hash()];
   store.parse_default(details);
-  m_defaults.emplace_back(details->essential_name(), details->value().get_default_value());
+  m_defaults.emplace_back(
+    details->essential_name(),
+    details->value().get_default_value(),
+    ValueSource::Default,
+    OptionOccurrence::npos,
+    OptionOccurrence::npos
+  );
 }
 
 inline
@@ -2638,14 +2829,21 @@ OptionParser::parse_option
 (
   const std::shared_ptr<OptionDetails>& value,
   const std::string& /*name*/,
-  const std::string& arg
+  const std::string& arg,
+  const OptionOccurrence& occurrence
 )
 {
   auto hash = value->hash();
   auto& result = m_parsed[hash];
-  result.parse(value, arg);
+  result.parse(value, arg, occurrence);
 
-  m_sequential.emplace_back(value->essential_name(), arg);
+  m_sequential.emplace_back(
+    value->essential_name(),
+    arg,
+    occurrence.source,
+    occurrence.argv_index,
+    occurrence.offset
+  );
 }
 
 inline
@@ -2656,14 +2854,18 @@ OptionParser::checked_parse_arg
   const char* const* argv,
   int& current,
   const std::shared_ptr<OptionDetails>& value,
-  const std::string& name
+  const std::string& name,
+  std::size_t offset
 )
 {
+  const std::size_t flag_index = static_cast<std::size_t>(current);
   if (current + 1 >= argc)
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(),
+        OptionOccurrence(ValueSource::Implicit,
+          value->value().get_implicit_value(), flag_index, offset));
     }
     else
     {
@@ -2674,11 +2876,15 @@ OptionParser::checked_parse_arg
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(),
+        OptionOccurrence(ValueSource::Implicit,
+          value->value().get_implicit_value(), flag_index, offset));
     }
     else
     {
-      parse_option(value, name, argv[current + 1]);
+      parse_option(value, name, argv[current + 1],
+        OptionOccurrence(ValueSource::CommandLine,
+          argv[current + 1], flag_index, offset));
       ++current;
     }
   }
@@ -2686,18 +2892,34 @@ OptionParser::checked_parse_arg
 
 inline
 void
-OptionParser::add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg)
+OptionParser::add_to_option
+(
+  const std::shared_ptr<OptionDetails>& value,
+  const std::string& arg,
+  const OptionOccurrence& occurrence
+)
 {
   auto hash = value->hash();
   auto& result = m_parsed[hash];
-  result.add(value, arg);
+  result.add(value, arg, occurrence);
 
-  m_sequential.emplace_back(value->essential_name(), arg);
+  m_sequential.emplace_back(
+    value->essential_name(),
+    arg,
+    occurrence.source,
+    occurrence.argv_index,
+    occurrence.offset
+  );
 }
 
 inline
 bool
-OptionParser::consume_positional(const std::string& a, PositionalListIterator& next)
+OptionParser::consume_positional
+(
+  const std::string& a,
+  PositionalListIterator& next,
+  std::size_t argv_index
+)
 {
   while (next != m_positional.end())
   {
@@ -2709,14 +2931,16 @@ OptionParser::consume_positional(const std::string& a, PositionalListIterator& n
         auto& result = m_parsed[iter->second->hash()];
         if (result.count() == 0)
         {
-          add_to_option(iter->second, a);
+          add_to_option(iter->second, a,
+            OptionOccurrence(ValueSource::CommandLine, a, argv_index, 0));
           ++next;
           return true;
         }
         ++next;
         continue;
       }
-      add_to_option(iter->second, a);
+      add_to_option(iter->second, a,
+        OptionOccurrence(ValueSource::CommandLine, a, argv_index, 0));
       return true;
     }
     throw_or_mimic<exceptions::no_such_option>(*next);
@@ -2798,7 +3022,8 @@ OptionParser::parse(int argc, const char* const* argv)
 
       //if true is returned here then it was consumed, otherwise it is
       //ignored
-      if (consume_positional(argv[current], next_positional))
+      if (consume_positional(argv[current], next_positional,
+            static_cast<std::size_t>(current)))
       {
       }
       else
@@ -2832,6 +3057,10 @@ OptionParser::parse(int argc, const char* const* argv)
 
           auto value = iter->second;
 
+          // offset of this option character within the current argv element
+          const std::size_t flag_offset = i + 1;
+          const std::size_t flag_index = static_cast<std::size_t>(current);
+
           if (i + 1 == s.size())
           {
             //it must be the last argument
@@ -2839,20 +3068,27 @@ OptionParser::parse(int argc, const char* const* argv)
               if(value->value().has_disabled_args()){
                 throw_or_mimic<exceptions::specified_disabled_args>(name);
               }
-              parse_option(value, name, argu_desc.value);
+              parse_option(value, name, argu_desc.value,
+                OptionOccurrence(ValueSource::CommandLine, argu_desc.value,
+                  flag_index, flag_offset));
             }
             else{
-              checked_parse_arg(argc, argv, current, value, name);
+              checked_parse_arg(argc, argv, current, value, name, flag_offset);
             }
           }
           else if (value->value().has_implicit())
           {
-            parse_option(value, name, value->value().get_implicit_value());
+            parse_option(value, name, value->value().get_implicit_value(),
+              OptionOccurrence(ValueSource::Implicit,
+                value->value().get_implicit_value(),
+                flag_index, flag_offset));
           }
           else if (i + 1 < s.size())
           {
             std::string arg_value = s.substr(i + 1);
-            parse_option(value, name, arg_value);
+            parse_option(value, name, arg_value,
+              OptionOccurrence(ValueSource::CommandLine, arg_value,
+                flag_index, flag_offset));
             break;
           }
           else
@@ -2891,12 +3127,14 @@ OptionParser::parse(int argc, const char* const* argv)
           }
           //parse the option given
 
-          parse_option(opt, name, argu_desc.value);
+          parse_option(opt, name, argu_desc.value,
+            OptionOccurrence(ValueSource::CommandLine, argu_desc.value,
+              static_cast<std::size_t>(current), 2));
         }
         else
         {
           //parse the next argument
-          checked_parse_arg(argc, argv, current, opt, name);
+          checked_parse_arg(argc, argv, current, opt, name, 2);
         }
       }
 
@@ -2926,7 +3164,8 @@ OptionParser::parse(int argc, const char* const* argv)
   {
     while (current < argc)
     {
-      if (!consume_positional(argv[current], next_positional)) {
+      if (!consume_positional(argv[current], next_positional,
+            static_cast<std::size_t>(current))) {
         break;
       }
       ++current;
