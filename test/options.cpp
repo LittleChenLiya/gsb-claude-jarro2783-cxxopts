@@ -1699,6 +1699,61 @@ TEST_CASE("Ordering of multiple long options", "[help]")
   CHECK(help.find("--beta") != std::string::npos);
 }
 
+TEST_CASE("Hidden options and help group ordering", "[help]")
+{
+  cxxopts::Options options("test", "Hidden options and group ordering");
+
+  options.add_options("first")
+    ("a,alpha", "Alpha option", cxxopts::value<int>())
+    ("b,beta,hidden-alias", "Beta option", cxxopts::value<std::string>());
+  options.add_options("second")
+    ("g,gamma", "Gamma option");
+
+  // The default help lists every option, groups in registration order.
+  const auto default_help = options.help();
+  CHECK(default_help.find("--alpha") != std::string::npos);
+  CHECK(default_help.find("--beta") != std::string::npos);
+  CHECK(default_help.find("--gamma") != std::string::npos);
+  CHECK(default_help.find("first options:") < default_help.find("second options:"));
+
+  // Hide an option through one of its aliases: aliases share a single
+  // display identity, so the whole entry disappears from the help.
+  options.hide_option("hidden-alias");
+  const auto hidden_help = options.help();
+  CHECK(hidden_help.find("--alpha") != std::string::npos);
+  CHECK(hidden_help.find("--beta") == std::string::npos);
+  CHECK(hidden_help.find("--gamma") != std::string::npos);
+
+  // The generated help is cached until the configuration changes.
+  CHECK(options.help() == hidden_help);
+
+  // A hidden option still parses, through any of its names.
+  Argv av({"test", "--hidden-alias", "value", "-a", "3", "--gamma"});
+  auto argc = av.argc();
+  auto** argv = av.argv();
+  const auto& result = options.parse(argc, argv);
+  CHECK(result["beta"].as<std::string>() == "value");
+  CHECK(result["alpha"].as<int>() == 3);
+  CHECK(result.count("gamma") == 1);
+
+  // Changing the explicit group order invalidates the cached help and
+  // the new help follows the requested order.
+  options.set_help_group_order({"second", "first"});
+  const auto reordered_help = options.help();
+  CHECK(reordered_help != hidden_help);
+  CHECK(reordered_help.find("second options:") < reordered_help.find("first options:"));
+  CHECK(reordered_help.find("--beta") == std::string::npos);
+
+  // Unhiding through another alias of the same option restores it.
+  options.show_option("beta");
+  CHECK(options.help().find("--beta") != std::string::npos);
+
+  // Resetting the help view restores the default help string exactly.
+  options.hide_option("beta");
+  options.reset_help_view();
+  CHECK(options.help() == default_help);
+}
+
 TEST_CASE("Help output wrapping", "[help]")
 {
   struct {

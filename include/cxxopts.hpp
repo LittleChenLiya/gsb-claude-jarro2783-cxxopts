@@ -2127,6 +2127,7 @@ class Options
   positional_help(std::string help_text)
   {
     m_positional_help = std::move(help_text);
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2134,6 +2135,7 @@ class Options
   custom_help(std::string help_text)
   {
     m_custom_help = std::move(help_text);
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2141,6 +2143,7 @@ class Options
   show_positional_help()
   {
     m_show_positional = true;
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2155,6 +2158,7 @@ class Options
   set_width(std::size_t width)
   {
     m_width = width;
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2162,6 +2166,49 @@ class Options
   set_tab_expansion(bool expansion=true)
   {
     m_tab_expansion = expansion;
+    invalidate_help_cache();
+    return *this;
+  }
+
+  // Independent help view configuration. A hidden option remains fully
+  // parseable but is omitted from the generated help. All names of an
+  // option (its short name and every long alias) share a single display
+  // identity, so hiding or showing any one of them affects the whole
+  // help entry.
+  Options&
+  hide_option(std::string option)
+  {
+    set_option_hidden(option, true);
+    return *this;
+  }
+
+  Options&
+  show_option(const std::string& option)
+  {
+    set_option_hidden(option, false);
+    return *this;
+  }
+
+  // Give an explicit group order for the help output. Listed groups are
+  // printed first in the given order; groups that are not listed keep
+  // their original registration order after the listed ones. Options
+  // within a group always keep their original registration order.
+  Options&
+  set_help_group_order(std::vector<std::string> groups)
+  {
+    m_help_group_order = std::move(groups);
+    invalidate_help_cache();
+    return *this;
+  }
+
+  // Reset the help view (hidden options and group order) so that the
+  // generated help is identical to the default again.
+  Options&
+  reset_help_view()
+  {
+    m_hidden_options.clear();
+    m_help_group_order.clear();
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2264,6 +2311,22 @@ class Options
   void
   generate_all_groups_help(String& result) const;
 
+  void
+  invalidate_help_cache()
+  {
+    m_help_cache_valid = false;
+    m_cached_help.clear();
+  }
+
+  bool
+  help_option_hidden(const HelpOptionDetails& o) const;
+
+  void
+  set_option_hidden(const std::string& option, bool hidden);
+
+  std::vector<std::string>
+  ordered_help_groups() const;
+
   std::string m_program{};
   String m_help_string{};
   std::string m_custom_help{};
@@ -2280,6 +2343,15 @@ class Options
   //mapping from groups to help options
   std::vector<std::string> m_group{};
   std::map<std::string, HelpGroupDetails> m_help{};
+
+  //independent help view configuration
+  std::unordered_set<std::string> m_hidden_options{};
+  std::vector<std::string> m_help_group_order{};
+
+  //cached default help output, invalidated by any change to the
+  //options or to the help view configuration
+  mutable std::string m_cached_help{};
+  mutable bool m_help_cache_valid{false};
 };
 
 class OptionAdder
@@ -2746,6 +2818,8 @@ Options::parse_positional(std::vector<std::string> options, PositionalMode mode)
       m_positional_set.insert(options.begin(), options.end());
       break;
   }
+
+  invalidate_help_cache();
 }
 
 inline
@@ -3012,6 +3086,8 @@ Options::add_option
       std::move(arg_help),
       value->is_container(),
       value->is_boolean()});
+
+  invalidate_help_cache();
 }
 
 inline
@@ -3028,6 +3104,105 @@ Options::add_one_option
   {
     throw_or_mimic<exceptions::option_already_exists>(option);
   }
+}
+
+inline
+void
+Options::set_option_hidden(const std::string& option, bool hidden)
+{
+  auto apply = [this, hidden](const std::string& name)
+  {
+    if (name.empty())
+    {
+      return;
+    }
+
+    if (hidden)
+    {
+      m_hidden_options.insert(name);
+    }
+    else
+    {
+      m_hidden_options.erase(name);
+    }
+  };
+
+  apply(option);
+
+  //aliases share a single display identity: resolve every name of the
+  //option so that hiding or showing any alias affects the whole entry
+  const auto resolved = m_options->find(option);
+  if (resolved != m_options->end())
+  {
+    apply(resolved->second->short_name());
+    for (const auto& long_name : resolved->second->long_names())
+    {
+      apply(long_name);
+    }
+  }
+
+  invalidate_help_cache();
+}
+
+inline
+bool
+Options::help_option_hidden(const HelpOptionDetails& o) const
+{
+  if (m_hidden_options.empty())
+  {
+    return false;
+  }
+
+  //all names of an option share a single display identity, so the
+  //entry is hidden when any of its names is hidden
+  if (!o.s.empty() && m_hidden_options.find(o.s) != m_hidden_options.end())
+  {
+    return true;
+  }
+
+  for (const auto& long_name : o.l)
+  {
+    if (m_hidden_options.find(long_name) != m_hidden_options.end())
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+inline
+std::vector<std::string>
+Options::ordered_help_groups() const
+{
+  if (m_help_group_order.empty())
+  {
+    return m_group;
+  }
+
+  std::vector<std::string> ordered;
+  std::unordered_set<std::string> seen;
+
+  //explicitly ordered groups come first, in the requested order
+  for (const auto& g : m_help_group_order)
+  {
+    if (seen.insert(g).second &&
+        std::find(m_group.begin(), m_group.end(), g) != m_group.end())
+    {
+      ordered.push_back(g);
+    }
+  }
+
+  //remaining groups keep their original registration order
+  for (const auto& g : m_group)
+  {
+    if (seen.insert(g).second)
+    {
+      ordered.push_back(g);
+    }
+  }
+
+  return ordered;
 }
 
 inline
@@ -3062,6 +3237,11 @@ Options::help_one_group(const std::string& g) const
       continue;
     }
 
+    if (help_option_hidden(o))
+    {
+      continue;
+    }
+
     auto s = format_option(o);
     longest = (std::max)(longest, stringLength(s));
     format.push_back(std::make_pair(s, String()));
@@ -3081,6 +3261,11 @@ Options::help_one_group(const std::string& g) const
     if (o.l.size() &&
         m_positional_set.find(o.l.front()) != m_positional_set.end() &&
         !m_show_positional)
+    {
+      continue;
+    }
+
+    if (help_option_hidden(o))
     {
       continue;
     }
@@ -3136,13 +3321,20 @@ inline
 void
 Options::generate_all_groups_help(String& result) const
 {
-  generate_group_help(result, m_group);
+  generate_group_help(result, ordered_help_groups());
 }
 
 inline
 std::string
 Options::help(const std::vector<std::string>& help_groups, bool print_usage) const
 {
+  const bool default_view = help_groups.empty() && print_usage;
+
+  if (default_view && m_help_cache_valid)
+  {
+    return m_cached_help;
+  }
+
   String result = m_help_string;
   if(print_usage)
   {
@@ -3171,7 +3363,15 @@ Options::help(const std::vector<std::string>& help_groups, bool print_usage) con
     generate_group_help(result, help_groups);
   }
 
-  return toUTF8String(result);
+  auto help_string = toUTF8String(result);
+
+  if (default_view)
+  {
+    m_cached_help = help_string;
+    m_help_cache_valid = true;
+  }
+
+  return help_string;
 }
 
 inline
