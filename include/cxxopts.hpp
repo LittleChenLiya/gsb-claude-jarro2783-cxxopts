@@ -1653,6 +1653,76 @@ struct HelpGroupDetails
   std::vector<HelpOptionDetails> options{};
 };
 
+//Independent view configuration controlling how the help text is rendered.
+//Hidden options remain fully parseable; they are only omitted from the
+//generated help. Hiding any name of an option hides the whole entry, so
+//all of its aliases share a single display identity. Groups are printed in
+//the explicitly configured order first, with any remaining groups following
+//in their original registration order. A default-constructed view changes
+//nothing, so the default help string is left untouched.
+class HelpView
+{
+  public:
+  HelpView&
+  hide_option(std::string name)
+  {
+    m_hidden.insert(std::move(name));
+    return *this;
+  }
+
+  HelpView&
+  show_option(const std::string& name)
+  {
+    m_hidden.erase(name);
+    return *this;
+  }
+
+  HelpView&
+  group_order(std::vector<std::string> groups)
+  {
+    m_group_order = std::move(groups);
+    return *this;
+  }
+
+  CXXOPTS_NODISCARD
+  bool
+  hides(const HelpOptionDetails& option) const
+  {
+    if (m_hidden.find(option.s) != m_hidden.end())
+    {
+      return true;
+    }
+
+    for (const auto& long_name : option.l)
+    {
+      if (m_hidden.find(long_name) != m_hidden.end())
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  CXXOPTS_NODISCARD
+  const std::vector<std::string>&
+  group_order() const
+  {
+    return m_group_order;
+  }
+
+  CXXOPTS_NODISCARD
+  bool
+  is_default() const
+  {
+    return m_hidden.empty() && m_group_order.empty();
+  }
+
+  private:
+  std::unordered_set<std::string> m_hidden{};
+  std::vector<std::string> m_group_order{};
+};
+
 class OptionValue
 {
   public:
@@ -2127,6 +2197,7 @@ class Options
   positional_help(std::string help_text)
   {
     m_positional_help = std::move(help_text);
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2134,6 +2205,7 @@ class Options
   custom_help(std::string help_text)
   {
     m_custom_help = std::move(help_text);
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2141,6 +2213,7 @@ class Options
   show_positional_help()
   {
     m_show_positional = true;
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2155,6 +2228,7 @@ class Options
   set_width(std::size_t width)
   {
     m_width = width;
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2162,6 +2236,24 @@ class Options
   set_tab_expansion(bool expansion=true)
   {
     m_tab_expansion = expansion;
+    invalidate_help_cache();
+    return *this;
+  }
+
+  //Access the independent help view configuration. Mutating the view
+  //through this reference invalidates any cached help text.
+  HelpView&
+  help_view()
+  {
+    invalidate_help_cache();
+    return m_help_view;
+  }
+
+  Options&
+  set_help_view(HelpView view)
+  {
+    m_help_view = std::move(view);
+    invalidate_help_cache();
     return *this;
   }
 
@@ -2264,6 +2356,15 @@ class Options
   void
   generate_all_groups_help(String& result) const;
 
+  std::vector<std::string>
+  ordered_groups() const;
+
+  void
+  invalidate_help_cache() const
+  {
+    m_help_cache_valid = false;
+  }
+
   std::string m_program{};
   String m_help_string{};
   std::string m_custom_help{};
@@ -2276,6 +2377,13 @@ class Options
   std::shared_ptr<OptionMap> m_options;
   std::vector<std::string> m_positional{};
   std::unordered_set<std::string> m_positional_set{};
+
+  //independent view configuration for the generated help
+  HelpView m_help_view{};
+
+  //cache of the default help text, invalidated on configuration changes
+  mutable std::string m_help_cache{};
+  mutable bool m_help_cache_valid = false;
 
   //mapping from groups to help options
   std::vector<std::string> m_group{};
@@ -2746,6 +2854,7 @@ Options::parse_positional(std::vector<std::string> options, PositionalMode mode)
       m_positional_set.insert(options.begin(), options.end());
       break;
   }
+  invalidate_help_cache();
 }
 
 inline
@@ -3012,6 +3121,8 @@ Options::add_option
       std::move(arg_help),
       value->is_container(),
       value->is_boolean()});
+
+  invalidate_help_cache();
 }
 
 inline
@@ -3055,6 +3166,11 @@ Options::help_one_group(const std::string& g) const
 
   for (const auto& o : group->second.options)
   {
+    if (m_help_view.hides(o))
+    {
+      continue;
+    }
+
     if (o.l.size() &&
         m_positional_set.find(o.l.front()) != m_positional_set.end() &&
         !m_show_positional)
@@ -3078,6 +3194,11 @@ Options::help_one_group(const std::string& g) const
   auto fiter = format.begin();
   for (const auto& o : group->second.options)
   {
+    if (m_help_view.hides(o))
+    {
+      continue;
+    }
+
     if (o.l.size() &&
         m_positional_set.find(o.l.front()) != m_positional_set.end() &&
         !m_show_positional)
@@ -3133,16 +3254,56 @@ Options::generate_group_help
 }
 
 inline
+std::vector<std::string>
+Options::ordered_groups() const
+{
+  const auto& explicit_order = m_help_view.group_order();
+
+  if (explicit_order.empty())
+  {
+    return m_group;
+  }
+
+  std::vector<std::string> ordered;
+  std::unordered_set<std::string> seen;
+
+  for (const auto& g : explicit_order)
+  {
+    if (m_help.find(g) != m_help.end() && seen.insert(g).second)
+    {
+      ordered.push_back(g);
+    }
+  }
+
+  for (const auto& g : m_group)
+  {
+    if (seen.insert(g).second)
+    {
+      ordered.push_back(g);
+    }
+  }
+
+  return ordered;
+}
+
+inline
 void
 Options::generate_all_groups_help(String& result) const
 {
-  generate_group_help(result, m_group);
+  generate_group_help(result, ordered_groups());
 }
 
 inline
 std::string
 Options::help(const std::vector<std::string>& help_groups, bool print_usage) const
 {
+  const bool cacheable = help_groups.empty() && print_usage;
+
+  if (cacheable && m_help_cache_valid)
+  {
+    return m_help_cache;
+  }
+
   String result = m_help_string;
   if(print_usage)
   {
@@ -3171,7 +3332,15 @@ Options::help(const std::vector<std::string>& help_groups, bool print_usage) con
     generate_group_help(result, help_groups);
   }
 
-  return toUTF8String(result);
+  auto output = toUTF8String(result);
+
+  if (cacheable)
+  {
+    m_help_cache = output;
+    m_help_cache_valid = true;
+  }
+
+  return output;
 }
 
 inline

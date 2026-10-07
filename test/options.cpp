@@ -2114,3 +2114,94 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+TEST_CASE("Help view hides options and reorders groups", "[help][view]")
+{
+  cxxopts::Options options("tester", " - test help view");
+
+  options.add_options()
+    ("v,verbose", "enable verbose output")
+    ("i,input", "input file", cxxopts::value<std::string>());
+  options.add_options("extra")
+    ("t,threads", "worker threads", cxxopts::value<int>());
+
+  const auto default_help = options.help();
+
+  SECTION("default view leaves the help string untouched")
+  {
+    CHECK(options.help_view().is_default());
+    CHECK(options.help() == default_help);
+    CHECK(default_help.find("--verbose") != std::string::npos);
+    CHECK(default_help.find("--input") != std::string::npos);
+    CHECK(default_help.find("--threads") != std::string::npos);
+    CHECK(default_help.find("extra options:") != std::string::npos);
+    //groups are generated in their original registration order
+    CHECK(default_help.find("--verbose") < default_help.find("extra options:"));
+  }
+
+  SECTION("hidden option still parses but is omitted from help")
+  {
+    options.help_view().hide_option("v");
+
+    const auto help = options.help();
+    CHECK(help != default_help);
+    CHECK(help.find("verbose") == std::string::npos);
+    CHECK(help.find("--input") != std::string::npos);
+    CHECK(help.find("--threads") != std::string::npos);
+
+    //aliases share a single display identity: hiding "v" hides "--verbose"
+    Argv argv({"tester", "--verbose", "--input", "in.txt", "--threads", "4"});
+    auto** actual_argv = argv.argv();
+    const auto result = options.parse(argv.argc(), actual_argv);
+    CHECK(result.count("verbose") == 1);
+    CHECK(result["input"].as<std::string>() == "in.txt");
+    CHECK(result["threads"].as<int>() == 4);
+
+    //hiding through the long alias hides the very same entry
+    cxxopts::Options aliased("tester", " - test help view");
+    aliased.add_options()
+      ("v,verbose", "enable verbose output")
+      ("i,input", "input file", cxxopts::value<std::string>());
+    aliased.help_view().hide_option("verbose");
+    CHECK(aliased.help().find("verbose") == std::string::npos);
+    CHECK(aliased.help().find("--input") != std::string::npos);
+  }
+
+  SECTION("unhiding restores the default help")
+  {
+    options.help_view().hide_option("verbose");
+    CHECK(options.help().find("verbose") == std::string::npos);
+    options.help_view().show_option("verbose");
+    CHECK(options.help() == default_help);
+  }
+
+  SECTION("explicit group order precedes registration order")
+  {
+    options.help_view().group_order({"extra"});
+
+    const auto help = options.help();
+    //the cached help was invalidated by the view change
+    CHECK(help != default_help);
+    CHECK(help.find("extra options:") < help.find("--verbose"));
+    CHECK(help.find("--input") != std::string::npos);
+
+    //unknown groups in the explicit order are ignored
+    options.help_view().group_order({"missing", "extra"});
+    CHECK(options.help() == help);
+  }
+
+  SECTION("set_help_view replaces the view and invalidates the cache")
+  {
+    cxxopts::HelpView view;
+    view.hide_option("input").group_order({"extra"});
+    options.set_help_view(view);
+
+    const auto help = options.help();
+    CHECK(help.find("--input") == std::string::npos);
+    CHECK(help.find("extra options:") < help.find("--verbose"));
+
+    //a default view reproduces the original help string
+    options.set_help_view(cxxopts::HelpView{});
+    CHECK(options.help() == default_help);
+  }
+}
