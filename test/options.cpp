@@ -279,6 +279,66 @@ TEST_CASE("Providing options values via equal sign", "[options]")
   }
 }
 
+TEST_CASE("Duplicate scalar options strict mode", "[options][duplicate]")
+{
+  cxxopts::Options options("test_duplicate", " - strict duplicate scalar handling");
+
+  options.add_options()
+    ("x,xopt", "a scalar option", cxxopts::value<int>())
+    ("v,vector", "a vector option", cxxopts::value<std::vector<int>>());
+
+  SECTION("Mixed '=' and separated spellings are rejected with both positions")
+  {
+    // "--xopt=1" at argv[1], "--xopt 2" option token at argv[2]
+    Argv argv{"test_duplicate", "--xopt=1", "--xopt", "2"};
+    options.reject_duplicate_scalar_options();
+    try
+    {
+      options.parse(argv.argc(), argv.argv());
+      FAIL("expected cxxopts::exceptions::duplicate_option");
+    }
+    catch (const cxxopts::exceptions::duplicate_option& e)
+    {
+      CHECK(e.first_position() == 1);
+      CHECK(e.second_position() == 2);
+    }
+  }
+
+  SECTION("Short separated then long '=' spellings share one count")
+  {
+    // "-x 1" option token at argv[1], "--xopt=2" at argv[3]
+    Argv argv{"test_duplicate", "-x", "1", "--xopt=2"};
+    options.reject_duplicate_scalar_options();
+    try
+    {
+      options.parse(argv.argc(), argv.argv());
+      FAIL("expected cxxopts::exceptions::duplicate_option");
+    }
+    catch (const cxxopts::exceptions::duplicate_option& e)
+    {
+      CHECK(e.first_position() == 1);
+      CHECK(e.second_position() == 3);
+    }
+  }
+
+  SECTION("Vector options keep accumulating in strict mode")
+  {
+    Argv argv{"test_duplicate", "--vector=1", "--vector", "2"};
+    options.reject_duplicate_scalar_options();
+    auto result = options.parse(argv.argc(), argv.argv());
+    CHECK(result.count("vector") == 2);
+    CHECK(result["vector"].as<std::vector<int>>() == std::vector<int>{1, 2});
+  }
+
+  SECTION("Default mode keeps the last scalar value")
+  {
+    Argv argv{"test_duplicate", "--xopt=1", "--xopt", "2"};
+    auto result = options.parse(argv.argc(), argv.argv());
+    CHECK(result.count("x") == 2);
+    CHECK(result["x"].as<int>() == 2);
+  }
+}
+
 TEST_CASE("Valid/Invalid Option names", "[options]")
 {
   const char prog_name[] = "test_invalid_opt_names";
