@@ -528,6 +528,54 @@ class missing_argument : public parsing
   }
 };
 
+class option_repeated : public parsing
+{
+  public:
+  option_repeated
+  (
+    const std::string& option,
+    int first_position,
+    int second_position
+  )
+  : parsing(
+      "Option " + LQUOTE + option + RQUOTE +
+      " specified more than once at positions " +
+      std::to_string(first_position) + " and " +
+      std::to_string(second_position)
+    )
+  , m_option(option)
+  , m_first_position(first_position)
+  , m_second_position(second_position)
+  {
+  }
+
+  CXXOPTS_NODISCARD
+  const std::string&
+  option() const noexcept
+  {
+    return m_option;
+  }
+
+  CXXOPTS_NODISCARD
+  int
+  first_position() const noexcept
+  {
+    return m_first_position;
+  }
+
+  CXXOPTS_NODISCARD
+  int
+  second_position() const noexcept
+  {
+    return m_second_position;
+  }
+
+  private:
+  std::string m_option;
+  int m_first_position;
+  int m_second_position;
+};
+
 class option_requires_argument : public parsing
 {
   public:
@@ -608,6 +656,23 @@ void throw_or_mimic(const std::string& text)
   // Otherwise manually instantiate the exception, print what() to stderr,
   // and exit
   T exception{text};
+  std::cerr << exception.what() << std::endl;
+  std::exit(EXIT_FAILURE);
+#endif
+}
+
+template <typename T, typename... Args>
+void
+throw_or_mimic_error(Args&&... args)
+{
+  static_assert(std::is_base_of<std::exception, T>::value,
+                "throw_or_mimic_error only works for std::exception and "
+                "deriving classes");
+
+#ifndef CXXOPTS_NO_EXCEPTIONS
+  throw T{std::forward<Args>(args)...};
+#else
+  T exception{std::forward<Args>(args)...};
   std::cerr << exception.what() << std::endl;
   std::exit(EXIT_FAILURE);
 #endif
@@ -2048,13 +2113,34 @@ using OptionMap = std::unordered_map<std::string, std::shared_ptr<OptionDetails>
 using PositionalList = std::vector<std::string>;
 using PositionalListIterator = PositionalList::const_iterator;
 
+// Controls how repeated scalar (non-container) options are handled.
+//
+// Allow:  repeated scalar options keep the last parsed value (the historical
+//         behaviour). Container options (e.g. value<std::vector<T>>) always
+//         accumulate independently of this setting.
+// Reject: specifying a scalar option more than once fails parsing with an
+//         exceptions::option_repeated error that reports both occurrence
+//         positions. Both "--x=1" and "--x 1" forms count uniformly.
+enum class ScalarDuplicatePolicy
+{
+  Allow,
+  Reject
+};
+
 class OptionParser
 {
   public:
-  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised)
+  OptionParser
+  (
+    const OptionMap& options,
+    const PositionalList& positional,
+    bool allow_unrecognised,
+    ScalarDuplicatePolicy scalar_duplicate_policy
+  )
   : m_options(options)
   , m_positional(positional)
   , m_allow_unrecognised(allow_unrecognised)
+  , m_scalar_duplicate_policy(scalar_duplicate_policy)
   {
   }
 
@@ -2075,14 +2161,20 @@ class OptionParser
   );
 
   void
-  add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg);
+  add_to_option
+  (
+    const std::shared_ptr<OptionDetails>& value,
+    const std::string& arg,
+    int position
+  );
 
   void
   parse_option
   (
     const std::shared_ptr<OptionDetails>& value,
     const std::string& name,
-    const std::string& arg = ""
+    const std::string& arg,
+    int position
   );
 
   void
@@ -2093,6 +2185,13 @@ class OptionParser
 
   private:
 
+  void
+  check_scalar_duplicate
+  (
+    const std::shared_ptr<OptionDetails>& value,
+    int position
+  );
+
   void finalise_aliases();
 
   const OptionMap& m_options;
@@ -2101,6 +2200,14 @@ class OptionParser
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
   bool m_allow_unrecognised;
+  ScalarDuplicatePolicy m_scalar_duplicate_policy;
+
+  // argv index at which each scalar option was first seen (only populated
+  // when m_scalar_duplicate_policy == Reject)
+  std::unordered_map<std::size_t, int> m_first_positions{};
+
+  // argv index of the token currently being parsed
+  int m_position = 0;
 
   ParsedHashMap m_parsed{};
   NameHashMap m_keys{};
@@ -2117,6 +2224,7 @@ class Options
   , m_positional_help("positional parameters")
   , m_show_positional(false)
   , m_allow_unrecognised(false)
+  , m_scalar_duplicate_policy(ScalarDuplicatePolicy::Allow)
   , m_width(76)
   , m_tab_expansion(false)
   , m_options(std::make_shared<OptionMap>())
@@ -2149,6 +2257,28 @@ class Options
   {
     m_allow_unrecognised = true;
     return *this;
+  }
+
+  // Reject scalar options that are specified more than once. Container
+  // options continue to accumulate regardless of this setting.
+  Options&
+  reject_repeated_scalar_options()
+  {
+    m_scalar_duplicate_policy = ScalarDuplicatePolicy::Reject;
+    return *this;
+  }
+
+  Options&
+  set_scalar_duplicate_policy(ScalarDuplicatePolicy policy)
+  {
+    m_scalar_duplicate_policy = policy;
+    return *this;
+  }
+
+  ScalarDuplicatePolicy
+  scalar_duplicate_policy() const
+  {
+    return m_scalar_duplicate_policy;
   }
 
   Options&
@@ -2270,6 +2400,7 @@ class Options
   std::string m_positional_help{};
   bool m_show_positional;
   bool m_allow_unrecognised;
+  ScalarDuplicatePolicy m_scalar_duplicate_policy;
   std::size_t m_width;
   bool m_tab_expansion;
 
@@ -2638,14 +2769,48 @@ OptionParser::parse_option
 (
   const std::shared_ptr<OptionDetails>& value,
   const std::string& /*name*/,
-  const std::string& arg
+  const std::string& arg,
+  int position
 )
 {
+  check_scalar_duplicate(value, position);
+
   auto hash = value->hash();
   auto& result = m_parsed[hash];
   result.parse(value, arg);
 
   m_sequential.emplace_back(value->essential_name(), arg);
+}
+
+inline
+void
+OptionParser::check_scalar_duplicate
+(
+  const std::shared_ptr<OptionDetails>& value,
+  int position
+)
+{
+  if (m_scalar_duplicate_policy != ScalarDuplicatePolicy::Reject)
+  {
+    return;
+  }
+
+  // Container options (e.g. std::vector) always accumulate.
+  if (value->value().is_container())
+  {
+    return;
+  }
+
+  auto hash = value->hash();
+  auto inserted = m_first_positions.emplace(hash, position);
+  if (!inserted.second)
+  {
+    throw_or_mimic_error<exceptions::option_repeated>(
+      value->essential_name(),
+      inserted.first->second,
+      position
+    );
+  }
 }
 
 inline
@@ -2663,7 +2828,7 @@ OptionParser::checked_parse_arg
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(), current);
     }
     else
     {
@@ -2674,11 +2839,11 @@ OptionParser::checked_parse_arg
   {
     if (value->value().has_implicit())
     {
-      parse_option(value, name, value->value().get_implicit_value());
+      parse_option(value, name, value->value().get_implicit_value(), current);
     }
     else
     {
-      parse_option(value, name, argv[current + 1]);
+      parse_option(value, name, argv[current + 1], current);
       ++current;
     }
   }
@@ -2686,8 +2851,15 @@ OptionParser::checked_parse_arg
 
 inline
 void
-OptionParser::add_to_option(const std::shared_ptr<OptionDetails>& value, const std::string& arg)
+OptionParser::add_to_option
+(
+  const std::shared_ptr<OptionDetails>& value,
+  const std::string& arg,
+  int position
+)
 {
+  check_scalar_duplicate(value, position);
+
   auto hash = value->hash();
   auto& result = m_parsed[hash];
   result.add(value, arg);
@@ -2709,14 +2881,14 @@ OptionParser::consume_positional(const std::string& a, PositionalListIterator& n
         auto& result = m_parsed[iter->second->hash()];
         if (result.count() == 0)
         {
-          add_to_option(iter->second, a);
+          add_to_option(iter->second, a, m_position);
           ++next;
           return true;
         }
         ++next;
         continue;
       }
-      add_to_option(iter->second, a);
+      add_to_option(iter->second, a, m_position);
       return true;
     }
     throw_or_mimic<exceptions::no_such_option>(*next);
@@ -2759,7 +2931,12 @@ inline
 ParseResult
 Options::parse(int argc, const char* const* argv)
 {
-  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+  OptionParser parser(
+    *m_options,
+    m_positional,
+    m_allow_unrecognised,
+    m_scalar_duplicate_policy
+  );
 
   return parser.parse(argc, argv);
 }
@@ -2775,6 +2952,8 @@ OptionParser::parse(int argc, const char* const* argv)
 
   while (current < argc)
   {
+    m_position = current;
+
     if (strcmp(argv[current], "--") == 0)
     {
       consume_remaining = true;
@@ -2839,7 +3018,7 @@ OptionParser::parse(int argc, const char* const* argv)
               if(value->value().has_disabled_args()){
                 throw_or_mimic<exceptions::specified_disabled_args>(name);
               }
-              parse_option(value, name, argu_desc.value);
+              parse_option(value, name, argu_desc.value, current);
             }
             else{
               checked_parse_arg(argc, argv, current, value, name);
@@ -2847,12 +3026,12 @@ OptionParser::parse(int argc, const char* const* argv)
           }
           else if (value->value().has_implicit())
           {
-            parse_option(value, name, value->value().get_implicit_value());
+            parse_option(value, name, value->value().get_implicit_value(), current);
           }
           else if (i + 1 < s.size())
           {
             std::string arg_value = s.substr(i + 1);
-            parse_option(value, name, arg_value);
+            parse_option(value, name, arg_value, current);
             break;
           }
           else
@@ -2891,7 +3070,7 @@ OptionParser::parse(int argc, const char* const* argv)
           }
           //parse the option given
 
-          parse_option(opt, name, argu_desc.value);
+          parse_option(opt, name, argu_desc.value, current);
         }
         else
         {
@@ -2926,6 +3105,7 @@ OptionParser::parse(int argc, const char* const* argv)
   {
     while (current < argc)
     {
+      m_position = current;
       if (!consume_positional(argv[current], next_positional)) {
         break;
       }

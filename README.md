@@ -115,6 +115,28 @@ and in the result object they are retrieved with:
 result.unmatched()
 ```
 
+## Repeated options
+
+By default a scalar option that appears more than once keeps its last value
+(the occurrence count is still available through `result["opt"].count()`),
+while container options such as `cxxopts::value<std::vector<T>>()`
+accumulate every value.
+
+If repeated scalar options should be an error instead, enable strict mode:
+
+```cpp
+options.reject_repeated_scalar_options();
+```
+
+The `--opt=value` and `--opt value` forms are counted uniformly. When a
+scalar option is repeated, parsing fails with an
+`cxxopts::exceptions::option_repeated` exception whose `first_position()`
+and `second_position()` methods report the argv indices of both
+occurrences. Container options continue to accumulate regardless of this
+setting. The policy can also be set explicitly with
+`set_scalar_duplicate_policy(cxxopts::ScalarDuplicatePolicy::Allow)` or
+`::Reject`.
+
 ## Exceptions
 
 Exceptional situations throw C++ exceptions. There are two types of

@@ -2114,3 +2114,94 @@ TEST_CASE("wrap_text", "[wrap_text]")
     }
   }
 }
+
+TEST_CASE("Repeated scalar options", "[options]")
+{
+  SECTION("Strict mode rejects mixed equals and separated forms")
+  {
+    cxxopts::Options options("tester", " - test repeated scalar options");
+
+    options.add_options()
+      ("xx", "a scalar option", cxxopts::value<int>())
+      ("vv", "a vector option", cxxopts::value<std::vector<std::string>>());
+    options.reject_repeated_scalar_options();
+
+    SECTION("equals form first, then separated form")
+    {
+      Argv argv({"test", "--xx=1", "--xx", "2"});
+      try
+      {
+        options.parse(argv.argc(), argv.argv());
+        FAIL("expected exception for repeated scalar option");
+      }
+      catch (const cxxopts::exceptions::option_repeated& e)
+      {
+        CHECK(e.option() == "xx");
+        // Both forms count as one occurrence each and the first and second
+        // locations are reported (not the final value).
+        CHECK(e.first_position() == 1);
+        CHECK(e.second_position() == 2);
+      }
+    }
+
+    SECTION("separated form first, then equals form")
+    {
+      Argv argv({"test", "--xx", "1", "--xx=2"});
+      try
+      {
+        options.parse(argv.argc(), argv.argv());
+        FAIL("expected exception for repeated scalar option");
+      }
+      catch (const cxxopts::exceptions::option_repeated& e)
+      {
+        CHECK(e.option() == "xx");
+        // The position is that of the option token itself, so the value
+        // token at index 2 is skipped and the second option sits at 3.
+        CHECK(e.first_position() == 1);
+        CHECK(e.second_position() == 3);
+      }
+    }
+
+    SECTION("repeated boolean flags are rejected as well")
+    {
+      cxxopts::Options flag_options("flags");
+      flag_options.add_options()
+        ("f,flag", "a flag");
+      flag_options.reject_repeated_scalar_options();
+      Argv argv({"test", "-f", "--flag"});
+      CHECK_THROWS_AS(flag_options.parse(argv.argc(), argv.argv()),
+        cxxopts::exceptions::option_repeated);
+    }
+
+    SECTION("vector options keep accumulating in strict mode")
+    {
+      Argv argv({"test", "--vv", "a", "--vv=b"});
+      auto result = options.parse(argv.argc(), argv.argv());
+      const auto& values = result["vv"].as<std::vector<std::string>>();
+      CHECK(values == std::vector<std::string>({"a", "b"}));
+      CHECK(result["vv"].count() == 2);
+    }
+  }
+
+  SECTION("Default mode keeps last scalar value and accumulates vectors")
+  {
+    cxxopts::Options options("tester", " - test default repeated handling");
+
+    options.add_options()
+      ("xx", "a scalar option", cxxopts::value<int>())
+      ("vv", "a vector option", cxxopts::value<std::vector<std::string>>());
+
+    CHECK(options.scalar_duplicate_policy()
+      == cxxopts::ScalarDuplicatePolicy::Allow);
+
+    Argv argv({"test", "--xx=1", "--xx", "2", "--vv", "a", "--vv=b"});
+    auto result = options.parse(argv.argc(), argv.argv());
+
+    // Original scalar behaviour: last value wins, but both occurrences count.
+    CHECK(result["xx"].as<int>() == 2);
+    CHECK(result["xx"].count() == 2);
+    const auto& values = result["vv"].as<std::vector<std::string>>();
+    CHECK(values == std::vector<std::string>({"a", "b"}));
+    CHECK(result["vv"].count() == 2);
+  }
+}
